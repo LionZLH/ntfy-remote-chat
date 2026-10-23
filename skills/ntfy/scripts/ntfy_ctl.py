@@ -328,9 +328,21 @@ def update_channel(channel_id: str, **fields) -> dict | None:
 
 
 RECENT_IDS_KEEP = 200
+SINCE_MARGIN_SECONDS = 60
 
 
-def mark_event_processed(channel_id: str, msg_id: str) -> dict | None:
+def build_since_query(ch: dict) -> str:
+    """断线补收的起点：按时间而不是按消息 ID。
+    实测 ntfy.sh 的 since=<消息ID> 不可靠：有时会重发已处理的消息，有时（刚发布的消息尚未写入缓存时）一条都不返回。
+    这里从上次处理的消息时间往前 60 秒开始补收，多收到的旧消息由 recent_ids 去重跳过。"""
+    last_time = int(ch.get("last_event_time") or 0)
+    if last_time:
+        return f"?since={max(0, last_time - SINCE_MARGIN_SECONDS)}"
+    last_id = ch.get("last_event_id", "")
+    return f"?since={urllib.parse.quote(last_id)}" if last_id else ""
+
+
+def mark_event_processed(channel_id: str, msg_id: str, msg_time: float = 0) -> dict | None:
     """记录已处理的消息：推进 last_event_id，并把消息 ID 加入持久化的去重列表。
     ntfy 的 since=<消息ID> 补发并不精确（同一秒内的消息可能被再次推送，实测 Windows/Linux 都会出现），
     只靠游标会导致重连后重复执行指令，所以必须按消息 ID 去重，且要跨进程重启保留。"""
@@ -342,6 +354,8 @@ def mark_event_processed(channel_id: str, msg_id: str) -> dict | None:
         ids.append(msg_id)
         ch["recent_ids"] = ids[-RECENT_IDS_KEEP:]
         ch["last_event_id"] = msg_id
+        if msg_time:
+            ch["last_event_time"] = max(int(msg_time), int(ch.get("last_event_time") or 0))
         return dict(ch)
 
 
@@ -1531,7 +1545,7 @@ class ChannelWorker(threading.Thread):
         if not msg_id or msg_id in self.seen_ids:
             return
         # 先推进游标再标记已处理：若更新失败（抛异常），重连后这条消息还会被重新处理，不会丢
-        ch = mark_event_processed(self.channel_id, msg_id)
+        ch = mark_event_processed(self.channel_id, msg_id, float(ev.get("time") or 0))
         self._remember(msg_id)
         if ch is None:
             self.stop_event.set()
@@ -1615,9 +1629,7 @@ class ChannelWorker(threading.Thread):
                 self.ch_config = curr_ch
                 self.stale_notices = 0
                 stream_url = f"{server}/{topic}/json"
-                last_id = curr_ch.get("last_event_id", "")
-                if last_id:
-                    stream_url += f"?since={urllib.parse.quote(last_id)}"
+                stream_url += build_since_query(curr_ch)
                 headers = {"User-Agent": USER_AGENT}
                 headers.update(_auth_headers(curr_ch.get("auth_token", "")))
                 req = urllib.request.Request(stream_url, headers=headers)

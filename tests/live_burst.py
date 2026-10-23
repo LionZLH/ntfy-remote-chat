@@ -2,7 +2,7 @@
 """联网测试：用真实的 ntfy.sh 服务器验证「连发多条」与「断线补收」。
 
 1. 实时连发：监听线程连上后，一次性连发 5 条消息，检查是否全部及时收到；
-2. 断线补收：监听停止期间发 3 条消息，重新连接后用 since 游标补收，检查是否全部补回。
+2. 断线补收（3 轮）：监听停止期间发 3 条消息，重新连接后检查恰好补回这 3 条，不漏也不重复执行。
 
 使用随机 Topic，消息里没有任何敏感内容。需要能访问 https://ntfy.sh。
 运行：python3 tests/live_burst.py
@@ -78,20 +78,23 @@ def main() -> int:
         w.stop()
         time.sleep(1)
 
-        # 2. 断线补收
-        received.clear()
-        offline = [f"离线-{i}" for i in range(3)]
-        for text in offline:
-            publish(topic, text)
-        time.sleep(1)
-        w2 = ntfy.ChannelWorker(cid, ntfy.load_registry()["channels"][cid])
-        w2.start()
-        T.wait_for(lambda: len(received) >= 3, 30)
-        got2 = [m for m, _ in received]
-        print("断线补收：", got2)
-        if sorted(got2) != sorted(offline):
-            failures.append(f"断线补收：离线期间发了 3 条，补收到 {len(got2)} 条")
-        w2.stop()
+        # 2. 断线补收：连续 3 轮「停止监听 → 离线期间发 3 条 → 重新连接」，每轮必须恰好补收这 3 条（不漏、不重复）
+        for rnd in range(3):
+            received.clear()
+            offline = [f"离线{rnd}-{i}" for i in range(3)]
+            for text in offline:
+                publish(topic, text)
+            time.sleep(1)
+            w2 = ntfy.ChannelWorker(cid, ntfy.load_registry()["channels"][cid])
+            w2.start()
+            T.wait_for(lambda: len(received) >= 3, 30)
+            time.sleep(2)  # 再等一会，确认没有重复补发的旧消息被执行
+            got2 = [m for m, _ in received]
+            print(f"第 {rnd + 1} 轮断线补收：", got2)
+            if sorted(got2) != sorted(offline):
+                failures.append(f"第 {rnd + 1} 轮断线补收：期望 {offline}，实际 {got2}")
+            w2.stop()
+            time.sleep(1)
 
     if failures:
         print("\nLIVE FAILED:\n- " + "\n- ".join(failures))

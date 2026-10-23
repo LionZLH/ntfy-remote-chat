@@ -255,6 +255,11 @@ class TextHelpers(unittest.TestCase):
         with mock.patch.object(ntfy.shutil, "which", return_value=None):
             self.assertIsNone(ntfy.find_windows_daemon_python((3, 9)))
 
+    def test_since_query_uses_time_with_margin(self):
+        self.assertEqual(ntfy.build_since_query({}), "")
+        self.assertEqual(ntfy.build_since_query({"last_event_id": "abc"}), "?since=abc")
+        self.assertEqual(ntfy.build_since_query({"last_event_id": "abc", "last_event_time": 1000}), "?since=940")
+
     def test_pid_alive(self):
         self.assertTrue(ntfy.is_pid_alive(os.getpid()))
         self.assertFalse(ntfy.is_pid_alive(2 ** 22 + 12345))
@@ -419,11 +424,11 @@ class NetworkTests(unittest.TestCase):
         real_mark = ntfy.mark_event_processed
         fail = {"n": 1}
 
-        def flaky_mark(channel_id, msg_id):
+        def flaky_mark(channel_id, msg_id, msg_time=0):
             if fail["n"] > 0:
                 fail["n"] -= 1
                 raise ntfy.RegistryReadError("模拟读失败")
-            return real_mark(channel_id, msg_id)
+            return real_mark(channel_id, msg_id, msg_time)
 
         with mock.patch.object(ntfy, "mark_event_processed", flaky_mark), \
                 mock.patch.object(ntfy, "dispatch_command_to_host",
