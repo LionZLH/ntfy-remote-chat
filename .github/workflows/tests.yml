@@ -22,6 +22,10 @@ jobs:
         include:
           - os: windows-latest
             python: "3.10"
+          - os: windows-latest
+            python: "3.11"
+          - os: windows-latest
+            python: "3.12"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -30,4 +34,5 @@ jobs:
       - name: Unit tests
         run: python -m unittest discover -s tests -v
       - name: Daemon smoke test (install service, phone command, uninstall)
+        if: always()
         run: python tests/smoke_daemon.py
