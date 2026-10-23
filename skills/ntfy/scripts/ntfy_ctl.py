@@ -327,6 +327,24 @@ def update_channel(channel_id: str, **fields) -> dict | None:
         return dict(ch)
 
 
+RECENT_IDS_KEEP = 200
+
+
+def mark_event_processed(channel_id: str, msg_id: str) -> dict | None:
+    """记录已处理的消息：推进 last_event_id，并把消息 ID 加入持久化的去重列表。
+    ntfy 的 since=<消息ID> 补发并不精确（同一秒内的消息可能被再次推送，实测 Windows/Linux 都会出现），
+    只靠游标会导致重连后重复执行指令，所以必须按消息 ID 去重，且要跨进程重启保留。"""
+    with registry_txn() as reg:
+        ch = reg.get("channels", {}).get(channel_id)
+        if ch is None:
+            return None
+        ids = [i for i in (ch.get("recent_ids") or []) if i != msg_id]
+        ids.append(msg_id)
+        ch["recent_ids"] = ids[-RECENT_IDS_KEEP:]
+        ch["last_event_id"] = msg_id
+        return dict(ch)
+
+
 def slugify_alias(raw: str) -> str:
     """将工作目录名或别名转为短标签（仅用于本地 channel_id，不进入 Topic）"""
     ascii_only = re.sub(r"[^a-zA-Z0-9]+", "", raw).lower()
@@ -1393,6 +1411,8 @@ class ChannelWorker(threading.Thread):
         self.tasks: queue.Queue = queue.Queue()
         self.busy = False
         self.stale_notices = 0
+        for old_id in ch_config.get("recent_ids") or []:  # 重启后也记得已处理过的消息
+            self._remember(old_id)
         self.current: dict | None = None  # {"text": 指令, "started": 开始时间}
         self.cancel_event = threading.Event()
         self.executor = threading.Thread(target=self._execute_loop, daemon=True)
@@ -1511,7 +1531,7 @@ class ChannelWorker(threading.Thread):
         if not msg_id or msg_id in self.seen_ids:
             return
         # 先推进游标再标记已处理：若更新失败（抛异常），重连后这条消息还会被重新处理，不会丢
-        ch = update_channel(self.channel_id, last_event_id=msg_id)
+        ch = mark_event_processed(self.channel_id, msg_id)
         self._remember(msg_id)
         if ch is None:
             self.stop_event.set()

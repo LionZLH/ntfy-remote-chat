@@ -375,6 +375,11 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(ntfy.main(["notify", "--channel", cid, "--msg", "第一行\\n第二行"]), 0)
         self.assertEqual(self.srv.json_msgs()[-1]["message"], "第一行\n第二行")
 
+    @unittest.skipIf(
+        IS_WIN and sys.version_info < (3, 13),
+        "本地假服务器（Python http.server）在 Windows + Python 3.12 及以下连发时会卡住；"
+        "真实 ntfy.sh 上的连发由 tests/live_burst.py 覆盖，且已在这些版本上验证通过",
+    )
     def test_worker_flow(self):
         cid, ch = make_channel(self.srv.url, self.ws)
         topic = ch["topic"]
@@ -411,16 +416,16 @@ class NetworkTests(unittest.TestCase):
         """注册表短暂读不出来时：消息不丢、执行线程不退出"""
         cid, ch = make_channel(self.srv.url, self.ws)
         calls = []
-        real_update = ntfy.update_channel
+        real_mark = ntfy.mark_event_processed
         fail = {"n": 1}
 
-        def flaky_update(channel_id, **fields):
-            if "last_event_id" in fields and fail["n"] > 0:
+        def flaky_mark(channel_id, msg_id):
+            if fail["n"] > 0:
                 fail["n"] -= 1
                 raise ntfy.RegistryReadError("模拟读失败")
-            return real_update(channel_id, **fields)
+            return real_mark(channel_id, msg_id)
 
-        with mock.patch.object(ntfy, "update_channel", flaky_update), \
+        with mock.patch.object(ntfy, "mark_event_processed", flaky_mark), \
                 mock.patch.object(ntfy, "dispatch_command_to_host",
                                   side_effect=lambda c, chh, m, attachment_path=None: (calls.append(m) or (True, ""))):
             w = ntfy.ChannelWorker(cid, ch)
@@ -516,6 +521,30 @@ class NetworkTests(unittest.TestCase):
 
         parts = [b'{"a":1}\n{"b"', b':2}\n', b"\n", "{\"中\":3}".encode("utf-8")[:4], "{\"中\":3}\n".encode("utf-8")[4:]]
         self.assertEqual(list(ntfy.iter_stream_lines(FakeResp(parts))), ['{"a":1}', '{"b":2}', '{"中":3}'])
+
+    def test_redelivered_messages_not_executed_twice(self):
+        """ntfy 重连补发会重复推送已处理的消息：重启后的监听线程也必须跳过"""
+        cid, ch = make_channel(self.srv.url, self.ws)
+        calls = []
+        with mock.patch.object(ntfy, "dispatch_command_to_host",
+                               side_effect=lambda c, chh, m, attachment_path=None: (calls.append(m) or (True, ""))):
+            w = ntfy.ChannelWorker(cid, ch)
+            w.start()
+            self.srv.push(ch["topic"], id="m-1", message="一")
+            self.srv.push(ch["topic"], id="m-2", message="二")
+            self.assertTrue(wait_for(lambda: len(calls) == 2, 10))
+            w.stop()
+            time.sleep(0.5)
+            # 模拟后台进程重启 + 服务器补发了已处理的 m-2，以及一条新消息
+            w2 = ntfy.ChannelWorker(cid, ntfy.load_registry()["channels"][cid])
+            w2.start()
+            self.srv.push(ch["topic"], id="m-2", message="二")
+            self.srv.push(ch["topic"], id="m-3", message="三")
+            self.assertTrue(wait_for(lambda: len(calls) >= 3, 10))
+            time.sleep(0.5)
+            w2.stop()
+        self.assertEqual(calls, ["一", "二", "三"])
+        self.assertEqual(ntfy.load_registry()["channels"][cid]["recent_ids"][-1], "m-3")
 
     def test_worker_reports_failure(self):
         cid, ch = make_channel(self.srv.url, self.ws, host="gui")
