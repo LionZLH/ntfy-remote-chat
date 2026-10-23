@@ -47,9 +47,17 @@ AI 会自动完成以下几步：
 
 ### 第二步：手机端订阅该频道
 
-1. 在手机上安装免费开源的 **ntfy** App（iOS App Store / Android Google Play 或 F-Droid）；
-2. 打开 App，点右下角 **`+`**，粘贴电脑端生成的 **Topic 名称**（或直接点击电脑给出的 `ntfy://ntfy.sh/<topic>` 链接）；
-3. 在输入框直接打字，或点回形针上传图片/文件，就能遥控电脑上的这个对话框执行任务。
+先在手机上安装免费开源的 **ntfy** App（iOS App Store / Android Google Play 或 F-Droid），然后按手机系统选择订阅方式：
+
+| 手机 | 订阅方式 |
+| :--- | :--- |
+| **Android** | 点击电脑给出的 `ntfy://ntfy.sh/<topic>?display=频道名` 链接（发到手机，在短信、备忘录、邮件等能点链接的地方点开），或扫描 **Android 二维码**，会**直接打开 ntfy App 并自动订阅**，频道名显示为中文标题 |
+| **iPhone** | iOS 版 ntfy App 不支持用链接或二维码拉起，需要手动添加：打开 App → 点 `+` → 粘贴 **Topic 名称** → Subscribe（自建服务器还要打开「Use another server」并填入服务器地址） |
+
+> - 微信等 App 的内置浏览器通常会拦截 `ntfy://` 链接；直接粘贴到浏览器地址栏也无效。
+> - `https://ntfy.sh/<topic>` 网页链接在两种手机上都只会打开网页版，不会拉起 App。
+
+订阅后，在输入框直接打字，或点回形针上传图片/文件，就能遥控电脑上的这个对话框执行任务。
 
 ---
 

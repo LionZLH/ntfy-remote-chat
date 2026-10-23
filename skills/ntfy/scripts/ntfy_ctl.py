@@ -821,6 +821,39 @@ def generate_qr_code(url: str, out_path: Path, allow_online: bool = False) -> tu
     return False, "skipped:offline-privacy-default"
 
 
+def build_app_url(server: str, topic: str, display: str = "") -> str:
+    """Android ntfy App 深链：点开即打开 App 并自动订阅（iOS App 没有注册 ntfy://，无法用链接拉起）。
+    格式 ntfy://<host>/<topic>?display=<名称>[&secure=false]；带路径前缀的服务器地址 App 不支持，返回空串。"""
+    u = urllib.parse.urlparse(server)
+    if not u.netloc or u.path.strip("/"):
+        return ""
+    params = {}
+    if display:
+        params["display"] = display
+    if u.scheme == "http":
+        params["secure"] = "false"
+    query = urllib.parse.urlencode(params, quote_via=urllib.parse.quote)
+    return f"ntfy://{u.netloc}/{topic}" + (f"?{query}" if query else "")
+
+
+def build_subscribe_guide(server: str, topic: str, app_url: str) -> dict:
+    custom_server = not is_ntfy_sh(server)
+    android = []
+    if app_url:
+        android.append(f"把链接 {app_url} 发到手机，在短信、备忘录、邮件等能点击链接的地方点开，会直接打开 ntfy App 并自动订阅"
+                       "（直接粘贴到浏览器地址栏无效；微信等 App 内置浏览器可能拦截）；")
+        android.append("或用手机相机/扫一扫扫描 Android 二维码；")
+    android.append(f"也可以手动添加：打开 ntfy App → 点右下角 + → 填入 Topic：{topic}"
+                   + (f"，勾选使用其他服务器并填入 {server}" if custom_server else ""))
+    iphone = [
+        "iPhone 版 ntfy App 不支持用链接或二维码直接拉起，需要手动添加：",
+        f"打开 ntfy App → 点 + → 粘贴 Topic：{topic}"
+        + (f" → 打开「Use another server」并填入 {server}" if custom_server else "")
+        + " → 点 Subscribe",
+    ]
+    return {"android": android, "iphone": iphone}
+
+
 def find_channel(reg: dict, selector: str) -> tuple[str | None, dict | None]:
     """支持按序号 (1, #1)、channel_id、conv_id、alias、title 或 topic 查找频道配置"""
     channels = reg.get("channels", {})
@@ -1772,9 +1805,10 @@ def cmd_bind(args: argparse.Namespace) -> int:
 
     server = (args.server or existing_ch.get("server") or DEFAULT_SERVER).rstrip("/")
     web_url = f"{server}/{topic}"
-    app_url = f"ntfy://{server.replace('https://', '').replace('http://', '')}/{topic}"
+    app_url = build_app_url(server, topic, title)
     qr_dir = Path(args.qr_dir).expanduser().resolve() if args.qr_dir else STATE_DIR / "qr"
-    qr_path = qr_dir / f"ntfy_qr_{channel_id}.png"
+    qr_path = qr_dir / f"ntfy_qr_{channel_id}.png"  # 网页链接码（iPhone 扫码会打开 Safari 网页版）
+    qr_app_path = qr_dir / f"ntfy_qr_{channel_id}_android.png"  # ntfy:// 码（Android 扫码直接打开 App 订阅）
 
     def pick(arg_val, key, default):
         return arg_val if arg_val is not None else existing_ch.get(key, default)
@@ -1806,6 +1840,7 @@ def cmd_bind(args: argparse.Namespace) -> int:
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "last_event_id": existing_ch.get("last_event_id", "") if topic == existing_ch.get("topic") else "",
         "qr_path": str(qr_path),
+        "qr_android_path": str(qr_app_path) if app_url else "",
     }
 
     if not entry["auth_token"]:
@@ -1828,6 +1863,9 @@ def cmd_bind(args: argparse.Namespace) -> int:
         reg_w.setdefault("channels", {})[channel_id] = entry
 
     qr_ok, qr_mode = generate_qr_code(web_url, qr_path, allow_online=args.online_qr)
+    qr_app_ok = False
+    if app_url:
+        qr_app_ok, _ = generate_qr_code(app_url, qr_app_path, allow_online=args.online_qr)
     daemon_info = ensure_background_daemon()
     power_info = detect_power_and_sleep_status()
 
@@ -1859,7 +1897,12 @@ def cmd_bind(args: argparse.Namespace) -> int:
             "泄露后他人可查看通知并向电脑发送指令。若不慎暴露，请在手机发送「销毁频道」或运行 rm 作废，"
             "并用 bind --rotate 换新 Topic。"
         ),
-        "qr_generated": qr_ok,
+        "subscribe_guide": build_subscribe_guide(server, topic, app_url),
+        "qr_generated": qr_ok or qr_app_ok,
+        "qr_codes": {
+            "android_app": str(qr_app_path) if qr_app_ok else None,
+            "web": str(qr_path) if qr_ok else None,
+        },
         "qr_mode": qr_mode,
         "test_notification_sent": test_sent,
         "daemon": daemon_info,
@@ -2018,8 +2061,10 @@ def _notify_destroyed(ch: dict, cid: str) -> None:
 
 def _remove_qr(ch: dict) -> None:
     with contextlib.suppress(Exception):
-        if ch.get("qr_path"):
-            Path(ch["qr_path"]).unlink()
+        for key in ("qr_path", "qr_android_path"):
+            if ch.get(key):
+                with contextlib.suppress(Exception):
+                    Path(ch[key]).unlink()
 
 
 def cmd_unbind(args: argparse.Namespace) -> int:

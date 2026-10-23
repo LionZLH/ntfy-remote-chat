@@ -216,6 +216,15 @@ class TextHelpers(unittest.TestCase):
             self.assertTrue(ntfy.is_sensitive_file(Path(n)), n)
         self.assertFalse(ntfy.is_sensitive_file(Path("report.pdf")))
 
+    def test_android_app_link(self):
+        url = ntfy.build_app_url("https://ntfy.sh", "nrc_abc", "我的项目")
+        self.assertEqual(url, "ntfy://ntfy.sh/nrc_abc?display=%E6%88%91%E7%9A%84%E9%A1%B9%E7%9B%AE")
+        self.assertEqual(ntfy.build_app_url("http://10.0.0.2:8080", "t", ""), "ntfy://10.0.0.2:8080/t?secure=false")
+        self.assertEqual(ntfy.build_app_url("https://x.com/ntfy", "t", "p"), "")  # 带路径前缀 App 不支持
+        guide = ntfy.build_subscribe_guide("https://my.host", "t1", "")
+        self.assertTrue(any("my.host" in g for g in guide["iphone"]))
+        self.assertTrue(all("ntfy://" not in g for g in guide["android"]))
+
     def test_pid_alive(self):
         self.assertTrue(ntfy.is_pid_alive(os.getpid()))
         self.assertFalse(ntfy.is_pid_alive(2 ** 22 + 12345))
@@ -557,6 +566,7 @@ class DaemonTests(unittest.TestCase):
         self.assertTrue(out["channel"]["conv_id_auto"])
         self.assertTrue(any("安全提示" in w for w in out["warnings"]))
         self.assertTrue(out["channel"]["topic"].startswith("nrc_"))
+        self.assertTrue(out["channel"]["app_url"].startswith("ntfy://ntfy.sh/nrc_"))
 
 
 if __name__ == "__main__":
