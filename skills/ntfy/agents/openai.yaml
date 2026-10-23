@@ -1,0 +1,4 @@
+interface:
+  display_name: "ntfy（手机 ntfy 双向远程对话）"
+  short_description: "输入 /ntfy 或 $ntfy 将当前对话框生成专属手机双向远程频道，支持防休眠守护与收发图片文档"
+  default_prompt: "使用 $ntfy 为当前对话框生成专属的 ntfy 手机双向远程控制频道，并开启防休眠与后台常驻监听。"
