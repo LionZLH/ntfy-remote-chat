@@ -198,3 +198,7 @@ python3 tests/smoke_daemon.py              # 冒烟测试：真实安装后台�
 
 - 测试使用本地假 ntfy 服务器和假 claude，不访问外网，也不消耗 AI 额度。
 - GitHub Actions 会在 Ubuntu、macOS、Windows 三个系统上，各用 Python 3.9 和 3.13 自动跑上面两项测试。
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE) 开源。软件按"原样"提供，不附带任何担保；使用风险见上方「安全须知与免责声明」。
