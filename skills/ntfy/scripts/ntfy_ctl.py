@@ -1368,8 +1368,8 @@ def iter_stream_lines(resp, stop_event: threading.Event | None = None):
     reader = getattr(resp, "read1", None)
     while stop_event is None or not stop_event.is_set():
         chunk = reader(65536) if reader else resp.readline()
-        if not chunk:
-            break
+        if not chunk or (stop_event is not None and stop_event.is_set()):
+            break  # 已停止的监听线程不再处理任何新到的消息
         buf += chunk
         while b"\n" in buf:
             raw, buf = buf.split(b"\n", 1)
@@ -1505,6 +1505,8 @@ class ChannelWorker(threading.Thread):
                 self.busy = False
 
     def _handle_event(self, ev: dict) -> None:
+        if self.stop_event.is_set():
+            return
         msg_id = ev.get("id", "")
         if not msg_id or msg_id in self.seen_ids:
             return

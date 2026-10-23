@@ -492,6 +492,20 @@ class NetworkTests(unittest.TestCase):
             ntfy._run_with_timeout([sys.executable, "-c", "import time; time.sleep(30)"], None, 1)
         self.assertLess(time.time() - t0, 15)
 
+    def test_stopped_worker_ignores_late_messages(self):
+        import threading as _t
+
+        class FakeResp:
+            def __init__(self, stop):
+                self.stop = stop
+
+            def read1(self, n):
+                self.stop.set()  # 模拟：阻塞读取期间线程被停止，随后数据才到达
+                return b'{"x":1}\n'
+
+        stop = _t.Event()
+        self.assertEqual(list(ntfy.iter_stream_lines(FakeResp(stop), stop)), [])
+
     def test_iter_stream_lines_split_chunks(self):
         class FakeResp:
             def __init__(self, parts):

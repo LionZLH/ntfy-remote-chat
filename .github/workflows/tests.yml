@@ -36,3 +36,6 @@ jobs:
       - name: Daemon smoke test (install service, phone command, uninstall)
         if: always()
         run: python tests/smoke_daemon.py
+      - name: Live test against ntfy.sh (burst + catch-up)
+        if: always()
+        run: python tests/live_burst.py
