@@ -345,6 +345,35 @@ def compress_video_for_preview(src_path: Path) -> Path | None:
     return None
 
 
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+TEXT_DOC_SUFFIXES = {".md", ".txt", ".csv", ".json", ".log", ".yaml", ".yml"}
+
+
+def upload_to_ntfy_file_store(
+    server: str,
+    topic: str,
+    upload_path: Path,
+    auth_token: str = "",
+) -> str:
+    """将非图片文件上传至寄存子通道 `<topic>_files` 并返回可直接点击打开的附件 URL"""
+    query_params = {
+        "filename": upload_path.name,
+    }
+    put_url = f"{server.rstrip('/')}/{topic}_files?{urllib.parse.urlencode(query_params)}"
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Content-Type": "application/octet-stream",
+    }
+    if auth_token:
+        headers["Authorization"] = f"Bearer {auth_token}"
+
+    data_bytes = upload_path.read_bytes()
+    req = urllib.request.Request(put_url, data=data_bytes, headers=headers, method="PUT")
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        body = json.loads(resp.read().decode("utf-8", errors="ignore"))
+        return (body.get("attachment") or {}).get("url", "")
+
+
 def send_ntfy_file(
     server: str,
     topic: str,
@@ -356,21 +385,22 @@ def send_ntfy_file(
     keep_emoji: bool = False,
 ) -> bool:
     """
-    向指定 ntfy 频道直接上传并推送本地文件/图片/视频/文档：
-    - 图片 (.png/.jpg/.webp/.gif) 在手机 ntfy App 上直接渲染为高清大图预览；
-    - 文档/音视频/代码包 (.pdf/.mp4/.md/.zip 等) 渲染为可一键打开或下载的附件卡片；
-    - 通过 URL Query 参数传递 UTF-8 中文标题、说明与文件名，避免 HTTP Header Latin-1 编码限制。
+    向指定 ntfy 频道发送本地图片、文档或视频（完美兼容 iOS / Android / Web）：
+    1. 图片 (.png/.jpg/.webp/.gif)：直接通过二进制 PUT 推送至主频道，手机 App 直接渲染高清大图预览；
+    2. 文本类文档 (.md/.txt/.csv/.json)：直接将文档内容以 Markdown 排版内联展示在消息气泡中（手机无需跳转即可阅读全文），并在底部附上原文件直链；
+    3. 二进制文档或视频 (.pdf/.pptx/.docx/.mp4/.zip)：先上传至 `<topic>_files` 获取 `https://ntfy.sh/file/...` 直链，再发送带可点击链接与 `click` 跳转的卡片（解决 iOS ntfy App 不显示非图片附件按钮的问题）。
     """
     if not file_path.is_file():
         print(f"[WARN] 附件文件不存在: {file_path}", file=sys.stderr)
         return False
 
+    suffix = file_path.suffix.lower()
     upload_path = file_path
     extra_note = ""
     file_size = file_path.stat().st_size
 
     if file_size > MAX_NTFY_FREE_BYTES:
-        if file_path.suffix.lower() in (".mp4", ".mov", ".mkv", ".avi"):
+        if suffix in (".mp4", ".mov", ".mkv", ".avi"):
             compressed = compress_video_for_preview(file_path)
             if compressed:
                 upload_path = compressed
@@ -388,31 +418,96 @@ def send_ntfy_file(
     full_msg = (message + extra_note).strip()
     clean_msg = full_msg if keep_emoji else strip_emojis(full_msg)
 
-    query_params = {
-        "filename": upload_path.name,
-        "title": clean_title,
-        "priority": str(priority),
-        "tags": "robot",
-    }
-    if clean_msg:
-        query_params["message"] = clean_msg
+    # 情况 A：图片文件 -> 直接 PUT 到主频道，iOS/Android 原生展示大图预览
+    if suffix in IMAGE_SUFFIXES:
+        query_params = {
+            "filename": upload_path.name,
+            "title": clean_title,
+            "priority": str(priority),
+            "tags": "robot",
+        }
+        if clean_msg:
+            query_params["message"] = clean_msg
 
-    put_url = f"{server.rstrip('/')}/{topic}?{urllib.parse.urlencode(query_params)}"
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Content-Type": "application/octet-stream",
-    }
-    if auth_token:
-        headers["Authorization"] = f"Bearer {auth_token}"
+        put_url = f"{server.rstrip('/')}/{topic}?{urllib.parse.urlencode(query_params)}"
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/octet-stream",
+        }
+        if auth_token:
+            headers["Authorization"] = f"Bearer {auth_token}"
 
+        try:
+            data_bytes = upload_path.read_bytes()
+            req = urllib.request.Request(put_url, data=data_bytes, headers=headers, method="PUT")
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                return resp.status in (200, 201, 202)
+        except Exception as e:
+            print(f"[WARN] ntfy 图片上传失败 ({file_path.name}): {e}", flush=True)
+            return False
+
+    # 情况 B：非图片文件（文档/PDF/视频/压缩包）
     try:
-        data_bytes = upload_path.read_bytes()
-        req = urllib.request.Request(put_url, data=data_bytes, headers=headers, method="PUT")
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return resp.status in (200, 201, 202)
+        file_url = upload_to_ntfy_file_store(server, topic, upload_path, auth_token=auth_token)
     except Exception as e:
-        print(f"[WARN] ntfy 文件上传失败 ({file_path.name}): {e}", flush=True)
-        return False
+        print(f"[WARN] ntfy 文档上传失败 ({file_path.name}): {e}", flush=True)
+        file_url = ""
+
+    size_kb = upload_path.stat().st_size / 1024.0
+    size_str = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb / 1024.0:.2f} MB"
+
+    # 若是 .md / .txt 等文本文档，直接把正文内容内联排版展示，并在末尾附上原文件下载链接
+    if suffix in TEXT_DOC_SUFFIXES:
+        try:
+            doc_text = upload_path.read_text(encoding="utf-8", errors="ignore").strip()
+            if not keep_emoji:
+                doc_text = strip_emojis(doc_text)
+            if len(doc_text) > 2800:
+                doc_text = doc_text[:2800] + "\n\n...(长文已截断，请点击下方链接查看完整原文件)..."
+        except Exception:
+            doc_text = ""
+
+        parts = []
+        if clean_msg:
+            parts.append(clean_msg)
+        if doc_text:
+            parts.append(f"---\n{doc_text}")
+        if file_url:
+            parts.append(f"---\n**[点击在浏览器打开/下载原文件：{upload_path.name} ({size_str})]({file_url})**")
+
+        combined_msg = "\n\n".join(parts)
+        return send_ntfy_message(
+            server=server,
+            topic=topic,
+            title=clean_title,
+            message=combined_msg,
+            priority=priority,
+            auth_token=auth_token,
+            keep_emoji=keep_emoji,
+            click_url=file_url,
+        )
+
+    # 若是 PDF / 视频 / Office / 压缩包等二进制文件，发送带可点击链接与 click 跳转的卡片
+    parts = []
+    if clean_msg:
+        parts.append(clean_msg)
+    if file_url:
+        parts.append(
+            f"**文件附件**\n"
+            f"- 文件名：`{upload_path.name}` ({size_str})\n"
+            f"- **[点击此处直接打开或下载文件]({file_url})**"
+        )
+    combined_msg = "\n\n".join(parts)
+    return send_ntfy_message(
+        server=server,
+        topic=topic,
+        title=clean_title,
+        message=combined_msg,
+        priority=priority,
+        auth_token=auth_token,
+        keep_emoji=keep_emoji,
+        click_url=file_url,
+    )
 
 
 def download_incoming_attachment(att: dict, workspace: str, auth_token: str = "") -> Path | None:
