@@ -98,16 +98,26 @@ class FakeNtfy:
                 self.send_header("Content-Type", "application/x-ndjson")
                 self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
-                try:
-                    deadline = time.time() + 20
-                    while time.time() < deadline:
-                        try:
-                            ev = q.get(timeout=0.2)
-                        except queue.Empty:
-                            continue
-                        line = (json.dumps(ev) + "\n").encode()
+                deadline = time.time() + 20
+                while time.time() < deadline:
+                    try:
+                        # 客户端断开后不再消费队列（真实服务器也不会把消息发给已断开的连接）
+                        self.wfile.write(b"1\r\n\n\r\n")  # 心跳：空行
+                        self.wfile.flush()
+                    except Exception:
+                        return
+                    try:
+                        ev = q.get(timeout=0.2)
+                    except queue.Empty:
+                        continue
+                    line = (json.dumps(ev) + "\n").encode()
+                    try:
                         self.wfile.write(f"{len(line):x}\r\n".encode() + line + b"\r\n")
                         self.wfile.flush()
+                    except Exception:
+                        q.put(ev)  # 没送达：放回队列，留给下一个连接
+                        return
+                try:
                     self.wfile.write(b"0\r\n\r\n")
                 except Exception:
                     pass
@@ -169,6 +179,9 @@ def wait_for(cond, timeout=10.0):
         if cond():
             return True
         time.sleep(0.05)
+    import faulthandler  # 超时时打印所有线程当前位置，便于定位卡在哪里
+
+    faulthandler.dump_traceback(all_threads=True)
     return False
 
 
@@ -259,6 +272,40 @@ class RegistryTests(unittest.TestCase):
         self.assertIsNone(ntfy.update_channel(cid, last_event_id="abc"))
         self.assertNotIn(cid, ntfy.load_registry()["channels"])
 
+    def test_read_error_never_treated_as_empty(self):
+        cid, _ = make_channel("http://x", TMP_HOME)
+        real_open = open
+        fails = {"n": 2}
+
+        def flaky_open(path, *a, **kw):
+            if str(path) == str(ntfy.REGISTRY_PATH) and fails["n"] > 0:
+                fails["n"] -= 1
+                raise PermissionError("模拟 Windows：文件正被替换")
+            return real_open(path, *a, **kw)
+
+        with mock.patch("builtins.open", flaky_open):
+            self.assertIn(cid, ntfy.load_registry()["channels"])  # 短暂失败：重试后读到
+
+        def always_fail(path, *a, **kw):
+            if str(path) == str(ntfy.REGISTRY_PATH):
+                raise PermissionError("一直被占用")
+            return real_open(path, *a, **kw)
+
+        with mock.patch("builtins.open", always_fail):
+            with self.assertRaises(ntfy.RegistryReadError):
+                with ntfy.registry_txn() as reg:
+                    reg["channels"].clear()
+        self.assertIn(cid, ntfy.load_registry()["channels"])  # 读不出来时绝不写回空注册表
+
+    def test_corrupt_registry_backed_up(self):
+        make_channel("http://x", TMP_HOME)
+        ntfy.REGISTRY_PATH.write_text("{broken", encoding="utf-8")
+        self.assertEqual(ntfy.load_registry()["channels"], {})
+        backups = list(ntfy.STATE_DIR.glob("registry.json.corrupt-*"))
+        self.assertTrue(backups)
+        for b in backups:
+            b.unlink()
+
     @unittest.skipIf(IS_WIN, "POSIX 文件权限")
     def test_registry_private(self):
         make_channel("http://x", TMP_HOME)
@@ -342,6 +389,36 @@ class NetworkTests(unittest.TestCase):
         self.assertTrue(any("系统状态" in t for t in titles))
         self.assertTrue(any("附件未接收" in t for t in titles))
         self.assertTrue(ntfy.load_registry()["channels"][cid]["last_event_id"])
+
+    def test_worker_survives_registry_read_error(self):
+        """注册表短暂读不出来时：消息不丢、执行线程不退出"""
+        cid, ch = make_channel(self.srv.url, self.ws)
+        calls = []
+        real_update = ntfy.update_channel
+        fail = {"n": 1}
+
+        def flaky_update(channel_id, **fields):
+            if "last_event_id" in fields and fail["n"] > 0:
+                fail["n"] -= 1
+                raise ntfy.RegistryReadError("模拟读失败")
+            return real_update(channel_id, **fields)
+
+        with mock.patch.object(ntfy, "update_channel", flaky_update), \
+                mock.patch.object(ntfy, "dispatch_command_to_host",
+                                  side_effect=lambda c, chh, m, attachment_path=None: (calls.append(m) or (True, ""))):
+            w = ntfy.ChannelWorker(cid, ch)
+            w.start()
+            self.srv.push(ch["topic"], id="same-1", message="重要指令")
+            # 读失败后线程会断开重连，假服务器按 since 重放同一条消息
+            end = time.time() + 6
+            while time.time() < end and not calls:
+                time.sleep(0.05)
+            ok = calls == ["重要指令"]
+            if not ok:
+                self.srv.push(ch["topic"], id="same-1", message="重要指令")
+                ok = wait_for(lambda: calls == ["重要指令"], 20)
+            w.stop()
+        self.assertTrue(ok, calls)
 
     def test_worker_reports_failure(self):
         cid, ch = make_channel(self.srv.url, self.ws, host="gui")

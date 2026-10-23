@@ -247,18 +247,40 @@ def _default_registry() -> dict:
     return {"version": 1, "sleep_guard": "auto", "min_battery": DEFAULT_MIN_BATTERY, "channels": {}}
 
 
+class RegistryReadError(RuntimeError):
+    """注册表暂时读不出来（如 Windows 上正被替换）。绝不能把它当成"没有频道"，否则会误停监听甚至写空注册表"""
+
+
 def load_registry() -> dict:
-    """只读加载（写入是原子替换，读不需要加锁）"""
+    """加载注册表（写入是原子替换，读不需要加锁）。
+    - 文件不存在：返回默认空注册表；
+    - 读失败（Windows 上替换文件的瞬间会拒绝访问）：短暂重试，仍失败则抛 RegistryReadError；
+    - 内容损坏：备份为 registry.json.corrupt-<时间> 后返回默认空注册表。"""
     ensure_state_dir()
-    if REGISTRY_PATH.is_file():
+    last_error: Exception | None = None
+    for _ in range(40):
         try:
             with open(REGISTRY_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict) and "channels" in data:
                 return data
-        except Exception:
-            pass
-    return _default_registry()
+            last_error = ValueError("registry.json 格式不正确")
+        except FileNotFoundError:
+            return _default_registry()
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
+            last_error = e
+        except OSError as e:  # PermissionError 等：文件正被替换或被其他程序占用
+            last_error = e
+            time.sleep(0.05)
+            continue
+        time.sleep(0.05)
+    if isinstance(last_error, (json.JSONDecodeError, UnicodeDecodeError, ValueError)):
+        backup = REGISTRY_PATH.with_name(f"registry.json.corrupt-{datetime.now().strftime('%Y%m%d%H%M%S')}")
+        with contextlib.suppress(Exception):
+            os.replace(REGISTRY_PATH, backup)
+        log(f"[WARN] registry.json 已损坏，已备份为 {backup.name} 并重建")
+        return _default_registry()
+    raise RegistryReadError(f"无法读取 {REGISTRY_PATH}: {last_error!r}")
 
 
 def _write_registry(reg: dict) -> None:
@@ -268,7 +290,14 @@ def _write_registry(reg: dict) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(reg, f, ensure_ascii=False, indent=2)
         _chmod_private(Path(tmp_name))
-        os.replace(tmp_name, REGISTRY_PATH)
+        for attempt in range(40):  # Windows：目标文件正被其他线程/进程读取时替换会拒绝访问，短暂重试
+            try:
+                os.replace(tmp_name, REGISTRY_PATH)
+                break
+            except PermissionError:
+                if attempt == 39:
+                    raise
+                time.sleep(0.05)
     except Exception:
         with contextlib.suppress(Exception):
             os.unlink(tmp_name)
@@ -1272,7 +1301,14 @@ class ChannelWorker(threading.Thread):
                 continue
             self.busy = True
             try:
-                ch = load_registry().get("channels", {}).get(self.channel_id)
+                try:
+                    ch = load_registry().get("channels", {}).get(self.channel_id)
+                except RegistryReadError as e:
+                    # 注册表暂时读不出来：放回队列稍后重试，不能让执行线程退出
+                    log(f"[WARN] [{self.channel_id}] {e}，稍后重试")
+                    self.tasks.put((message, att_path))
+                    self.stop_event.wait(1)
+                    continue
                 if not ch or ch.get("status", "active") != "active":
                     continue
                 title = ch.get("title") or ch.get("alias") or "远程对话"
@@ -1290,10 +1326,11 @@ class ChannelWorker(threading.Thread):
 
     def _handle_event(self, ev: dict) -> None:
         msg_id = ev.get("id", "")
-        if not msg_id or not self._remember(msg_id):
+        if not msg_id or msg_id in self.seen_ids:
             return
-        # 先推进游标，避免重连时反复重放同一条消息
+        # 先推进游标再标记已处理：若更新失败（抛异常），重连后这条消息还会被重新处理，不会丢
         ch = update_channel(self.channel_id, last_event_id=msg_id)
+        self._remember(msg_id)
         if ch is None:
             self.stop_event.set()
             return

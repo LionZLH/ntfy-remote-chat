@@ -28,6 +28,8 @@ def run(args: list[str], env: dict, timeout: int = 90) -> subprocess.CompletedPr
 
 
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):  # Windows 默认 cp1252，打印中文日志会报错
+        stream.reconfigure(encoding="utf-8", errors="replace")
     srv = T.FakeNtfy()
     ws = Path(T.tempfile.mkdtemp(prefix="smoke_ws_"))
     bindir = T.make_fake_cli("claude", "print('smoke ok：已收到指令')\n")
