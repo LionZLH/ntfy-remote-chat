@@ -1,4 +1,0 @@
-interface:
-  display_name: "ntfy-remote-chat（手机 ntfy 双向远程对话）"
-  short_description: "将当前对话框一键生成专属 ntfy 手机双向远程频道，支持防休眠守护、跨 IDE 唤醒与双向收发图片文件"
-  default_prompt: "使用 $ntfy-remote-chat 为当前对话框生成专属的 ntfy 手机双向远程控制频道，并开启防休眠与后台常驻监听。"
