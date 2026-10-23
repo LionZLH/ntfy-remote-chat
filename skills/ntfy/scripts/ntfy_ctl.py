@@ -39,6 +39,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import uuid
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -944,13 +945,20 @@ def run_claude(ch: dict, prompt: str, timeout: int) -> tuple[bool, str]:
     workspace = ch.get("workspace", str(HOME))
     conv_id = ch.get("conv_id", "")
     cmd = [exe]
+    new_own_session = ""
     if conv_id and not is_auto_conv_id(ch):
         cmd += ["--resume", conv_id]
+    elif ch.get("own_session_id") and ch.get("own_session_created"):
+        cmd += ["--resume", ch["own_session_id"]]
     else:
-        cmd += ["--continue"]
+        # 频道专属会话：只属于这个手机频道，绝不会落进同目录下的其他对话
+        new_own_session = str(uuid.uuid4())
+        cmd += ["--session-id", new_own_session]
     cmd += ["--permission-mode", ch.get("permission_mode") or DEFAULT_CLAUDE_PERMISSION_MODE, "-p"]
     res = _run_with_timeout(cmd, workspace, timeout, env=clean_child_env(ch), input_text=prompt)
     out = (res.stdout or "").strip()
+    if new_own_session and res.returncode == 0 and ch.get("channel_id"):
+        update_channel(ch["channel_id"], own_session_id=new_own_session, own_session_created=True)
     if res.returncode != 0:
         return False, (res.stderr or out or f"claude 退出码 {res.returncode}").strip()[-1500:]
     return True, out or "执行完成（无文字输出）"
@@ -972,20 +980,37 @@ def run_codex(ch: dict, prompt: str, timeout: int) -> tuple[bool, str]:
     ]
     try:
         res = None
+        own_new = False
+        resume_id = ""
         if conv_id and not is_auto_conv_id(ch):
-            res = _run_with_timeout(base + ["resume", conv_id, "-"], workspace, timeout, env=env, input_text=prompt)
+            resume_id = conv_id
+        elif ch.get("own_session_id") and ch.get("own_session_created"):
+            resume_id = ch["own_session_id"]
+        if resume_id:
+            res = _run_with_timeout(base + ["resume", resume_id, "-"], workspace, timeout, env=env, input_text=prompt)
             err = (res.stderr or "").lower()
             # 只有"会话不存在"或参数不被接受时才改开新会话；其他失败直接上报，避免同一任务被执行两遍
             if res.returncode != 0 and (res.returncode == 2 or "no rollout found" in err or "not found" in err):
-                log(f"[WARN] Codex 会话 {conv_id} 无法续接，改为新会话执行")
+                log(f"[WARN] Codex 会话 {resume_id} 无法续接，改为新会话执行")
                 res = None
         if res is None:
-            res = _run_with_timeout(base + ["-"], workspace, timeout, env=env, input_text=prompt)
+            own_new = is_auto_conv_id(ch) or not conv_id
+            res = _run_with_timeout(base + ["--json", "-"], workspace, timeout, env=env, input_text=prompt)
+            if own_new and res.returncode == 0 and ch.get("channel_id"):
+                thread_id = ""
+                for line in (res.stdout or "").splitlines():
+                    with contextlib.suppress(Exception):
+                        ev = json.loads(line)
+                        if ev.get("type") == "thread.started" and ev.get("thread_id"):
+                            thread_id = ev["thread_id"]
+                            break
+                if thread_id:
+                    update_channel(ch["channel_id"], own_session_id=thread_id, own_session_created=True)
         try:
             last_msg = Path(last_msg_path).read_text(encoding="utf-8", errors="replace").strip()
         except Exception:
             last_msg = ""
-        out = last_msg or (res.stdout or "").strip()[-3000:]
+        out = last_msg or ("" if "--json" in res.args else (res.stdout or "").strip()[-3000:])
         if res.returncode != 0:
             return False, (res.stderr or out or f"codex 退出码 {res.returncode}").strip()[-1500:]
         return True, out or "执行完成（无文字输出）"
@@ -1714,16 +1739,19 @@ def cmd_bind(args: argparse.Namespace) -> int:
     conv_id_auto = not conv_id
     warnings: list[str] = []
     if conv_id_auto:
-        conv_id = f"{host}-{alias}"
+        conv_id = f"{host}-{alias}-{secrets.token_hex(4)}"
         warnings.append(
-            "未能获取当前会话 ID：手机指令将投递到该目录下最近的会话（claude --continue / codex 新会话），"
-            "同一项目开多个对话框会共用一个频道。建议显式传入 --conv-id。"
+            "未能获取当前会话 ID：本频道会使用一个专属的新会话来执行手机指令（与当前对话框的上下文分开，"
+            "但绝不会落进其他对话）。如希望手机指令接着当前对话执行，请用 --conv-id 传入会话 ID 重新绑定。"
         )
     if host == "gui":
         warnings.append("未识别到可自动唤醒的宿主（antigravity / claude / codex），手机指令将无法执行，只能用 notify 推送结果。")
 
     reg = load_registry()
-    existing_cid, existing_ch = find_channel(reg, conv_id)
+    # 只按会话 ID 精确匹配（不用序号/名称等模糊匹配），避免绑定到别的对话框的频道
+    existing_cid, existing_ch = next(
+        ((cid, c) for cid, c in reg.get("channels", {}).items() if c.get("conv_id") == conv_id), (None, None)
+    )
     existing_ch = existing_ch or {}
     channel_id = existing_cid or f"ch_{slugify_alias(alias)}_{secrets.token_hex(3)}"
 
@@ -1762,6 +1790,8 @@ def cmd_bind(args: argparse.Namespace) -> int:
         "codex_sandbox": pick(args.codex_sandbox, "codex_sandbox", DEFAULT_CODEX_SANDBOX),
         "task_timeout": int(pick(args.task_timeout, "task_timeout", DEFAULT_TASK_TIMEOUT)),
         "host_bin": shutil.which(host) or "" if host in ("claude", "codex") else "",
+        "own_session_id": existing_ch.get("own_session_id", ""),
+        "own_session_created": bool(existing_ch.get("own_session_created")),
         "env_path": os.environ.get("PATH", ""),
         "status": "active",
         "created_at": existing_ch.get("created_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),

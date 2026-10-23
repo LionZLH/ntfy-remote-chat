@@ -73,7 +73,7 @@ NTFY uninstall [--purge]
 | Antigravity | `antigravity` | `Conversation ID` / `ANTIGRAVITY_CONVERSATION_ID` | `agentapi send-message` 投递到原对话，由 AI 自己调用 notify |
 | 其他（Cursor、WorkBuddy 等） | — | — | 暂不支持从手机唤醒，只能用 `notify` 单向推送 |
 
-拿不到会话 ID 时脚本会退回"该目录最近的会话"，并在 `warnings` 里说明，需转告用户。
+拿不到会话 ID 时，脚本会为该频道新建专属会话（与当前对话上下文分开，但绝不会串到其他对话），并在 `warnings` 里说明，需转告用户。调用 `notify` 时用频道 ID（`channel_id`），不要用面板序号。
 
 ---
 

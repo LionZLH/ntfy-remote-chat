@@ -63,6 +63,11 @@ AI 会自动完成以下几步：
 | Cursor、WorkBuddy 等 | 暂不支持从手机唤醒 | 可用 `notify` 单向推送 |
 
 - Claude Code 通过 `--resume` 在后台进程中执行。IDE 里正在显示的窗口不会实时刷新，结果以手机推送为准。
+- **同一台电脑、多个 IDE、多个对话同时开启也不会串台。**
+  - 每个对话框有自己独立的 Topic 和频道，手机发到哪个频道，就只交给那个频道绑定的会话执行。
+  - 绑定时只按会话 ID 精确匹配；同一个对话重复绑定，会复用原来的频道。
+  - 拿不到会话 ID 时（比如在别的终端里手动运行），会为这个频道新建一个**专属会话**，之后的指令都接着这个会话执行，不会落进同目录下的其他对话。
+- `notify` 推送时请用频道 ID，不要用面板序号，因为删除频道后序号会变化。
 - 同一频道的指令排队逐条执行，单条默认最长 30 分钟（`--task-timeout` 可调）。
 - 以下情况都会回执告诉手机原因，不会静默丢弃：执行失败、宿主不支持、电脑休眠期间发来的过期指令（超过 300 秒）。
 
@@ -107,13 +112,13 @@ python3 $NTFY bind --host claude --workspace "$PWD" --title "我的项目"
 #         --task-timeout 3600   --ack   --keep-emoji
 
 # 推送多行文字：用 --msg-file - 从标准输入读取，避免引号转义问题
-python3 $NTFY notify --channel 1 --title "任务完成" --msg-file - <<'EOF'
+python3 $NTFY notify --channel <频道ID> --title "任务完成" --msg-file - <<'EOF'
 **执行结果**
 已完成处理，请查收图片与报告。
 EOF
 
 # 推送图片/文档/视频（可传多个 --file；.env、私钥、凭证类文件会被拒绝）
-python3 $NTFY notify --channel 1 --msg "请查收" --file ./preview.png --file ./report.md
+python3 $NTFY notify --channel <频道ID> --msg "请查收" --file ./preview.png --file ./report.md
 
 # 管理频道
 python3 $NTFY rm 1            # 同 unbind / delete；加 --quiet 不通知手机

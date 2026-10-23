@@ -139,7 +139,7 @@ def make_fake_cli(name: str, body: str) -> Path:
     log_path = bindir / "calls.jsonl"
     code = (
         "import json,os,sys\n"
-        "stdin=sys.stdin.read()\n"
+        "stdin=sys.stdin.buffer.read().decode('utf-8')\n"
         f"open({str(log_path)!r},'a',encoding='utf-8').write(json.dumps({{'argv':sys.argv[1:],'stdin':stdin,"
         "'claudecode':os.environ.get('CLAUDECODE')}, ensure_ascii=False)+'\\n')\n" + body
     )
@@ -355,7 +355,12 @@ class NetworkTests(unittest.TestCase):
         self.assertTrue(ok, detail)
         call = fake_calls(bindir)[0]
         argv = call["argv"]
-        self.assertIn("--continue", argv)  # conv_id 是自动生成的，不能 --resume
+        # 拿不到会话 ID：新建频道专属会话，而不是 --continue 接上同目录里最近的（可能是别人的）会话
+        self.assertNotIn("--continue", argv)
+        own = argv[argv.index("--session-id") + 1]
+        saved = ntfy.load_registry()["channels"][cid]
+        self.assertEqual(saved["own_session_id"], own)
+        self.assertTrue(saved["own_session_created"])
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "acceptEdits")
         self.assertEqual(argv[-1], "-p")  # 提示词不在命令行参数里
         self.assertIn("画图 & \"引号\"", call["stdin"])  # 而是经标准输入原样传入
@@ -366,6 +371,10 @@ class NetworkTests(unittest.TestCase):
         self.assertIn("完成了", final)
         self.assertNotIn("NTFY_FILE", final)
         self.assertIn("已拒绝工作目录外的文件", final)
+        with mock.patch.dict(os.environ, env):
+            ntfy.dispatch_command_to_host(cid, saved, "第二条")
+        argv2 = fake_calls(bindir)[1]["argv"]
+        self.assertEqual(argv2[argv2.index("--resume") + 1], own)  # 第二条指令续接同一个专属会话
 
     def test_claude_found_via_bind_path(self):
         bindir = make_fake_cli("claude", "print('ok')\n")
@@ -400,6 +409,24 @@ class NetworkTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("model error", detail)
         self.assertEqual(len(fake_calls(bindir2)), 1)
+
+    def test_codex_own_session(self):
+        bindir = make_fake_cli(
+            "codex",
+            "out=sys.argv[sys.argv.index('--output-last-message')+1]\nopen(out,'w').write('完成')\n"
+            "if '--json' in sys.argv:\n    print(json.dumps({'type':'thread.started','thread_id':'th-own-1'}))\n",
+        )
+        cid, ch = make_channel(self.srv.url, self.ws, host="codex")  # conv_id 自动生成
+        with mock.patch.dict(os.environ, {"PATH": with_path(bindir)}):
+            ok, detail = ntfy.dispatch_command_to_host(cid, ch, "一")
+            self.assertTrue(ok, detail)
+            saved = ntfy.load_registry()["channels"][cid]
+            self.assertEqual(saved["own_session_id"], "th-own-1")
+            ok, detail = ntfy.dispatch_command_to_host(cid, saved, "二")
+        calls = fake_calls(bindir)
+        self.assertNotIn("resume", calls[0]["argv"])
+        self.assertEqual(calls[1]["argv"][-3:], ["resume", "th-own-1", "-"])
+        self.assertEqual(self.srv.json_msgs()[-1]["message"], "完成")
 
     def test_legacy_channel_auto_conv_id(self):
         self.assertTrue(ntfy.is_auto_conv_id({"host": "claude", "alias": "proj", "conv_id": "claude-proj"}))
@@ -477,6 +504,47 @@ class DaemonTests(unittest.TestCase):
         finally:
             p1.terminate()
             p1.wait(timeout=10)
+
+    def test_multi_dialog_binds_do_not_merge(self):
+        """同一项目的多个对话框（含拿不到会话 ID 的）各自独立；会话 ID 恰好等于别的频道名称时也不会认错"""
+        home = tempfile.mkdtemp(prefix="ntfy_multi_home_")
+        ws = tempfile.mkdtemp(prefix="proj_")
+        base = {k: v for k, v in os.environ.items() if not k.startswith(("CLAUDE", "CODEX", "ANTIGRAVITY"))}
+        base.update(HOME=home, USERPROFILE=home)
+
+        def bind(extra, *args):
+            r = subprocess.run(
+                [sys.executable, str(SCRIPT), "bind", "--no-test", "--dry-run", "--host", "claude",
+                 "--workspace", ws, *args],
+                capture_output=True, text=True, encoding="utf-8", timeout=30, env=dict(base, **extra),
+            )
+            return json.loads(r.stdout)["channel"]
+
+        # dry-run 不写注册表，这里用真实写入来检验去重逻辑
+        def bind_real(extra, *args):
+            r = subprocess.run(
+                [sys.executable, str(SCRIPT), "bind", "--no-test", "--server", "http://127.0.0.1:9", "--host", "claude",
+                 "--workspace", ws, *args],
+                capture_output=True, text=True, encoding="utf-8", timeout=60, env=dict(base, **extra),
+            )
+            return json.loads(r.stdout)["channel"]
+
+        try:
+            a = bind_real({"CLAUDE_CODE_SESSION_ID": "sess-a"}, "--title", "sess-b")
+            b = bind_real({"CLAUDE_CODE_SESSION_ID": "sess-b"})
+            c = bind_real({})
+            d = bind_real({})
+            a2 = bind_real({"CLAUDE_CODE_SESSION_ID": "sess-a"})
+            ids = [x["channel_id"] for x in (a, b, c, d)]
+            self.assertEqual(len(set(ids)), 4)
+            self.assertEqual(len({x["topic"] for x in (a, b, c, d)}), 4)
+            self.assertTrue(c["conv_id_auto"] and d["conv_id_auto"])
+            self.assertEqual(a2["channel_id"], a["channel_id"])  # 同一对话重复绑定：复用原频道
+            self.assertEqual(a2["topic"], a["topic"])
+            self.assertIsNotNone(bind)
+        finally:
+            subprocess.run([sys.executable, str(SCRIPT), "uninstall", "--purge"], env=base,
+                           capture_output=True, timeout=60)
 
     def test_bind_dry_run_warnings(self):
         r = subprocess.run(
