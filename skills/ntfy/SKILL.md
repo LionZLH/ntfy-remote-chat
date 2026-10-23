@@ -5,7 +5,7 @@ metadata:
   dbs-handoff: |
     - 用户输入 /ntfy、$ntfy 或要求为当前对话框生成/绑定 ntfy 远程对话 → 识别当前会话 ID、工作目录与宿主类型，运行 scripts/ntfy_ctl.py bind 生成 160-bit 高熵 Topic、激活防休眠与常驻守护、发送测试卡片，并交付订阅链接与电源防休眠状态
     - 收到来自手机 ntfy 频道的远程指令（或手机上传的图片/文件） → 读取指令及 .ntfy_inbox/ 下的附件，在绑定工作目录下执行任务，完成后调用 scripts/ntfy_ctl.py notify（若有图片/文件产出则加 --file）将结果推回手机
-    - 用户要求查看、暂停、恢复、解绑频道或开关防休眠 → 运行 scripts/ntfy_ctl.py status / unbind / sleep 并汇报实际状态
+    - 用户输入 /ntfy panel、查看所有已配置对话服务、删除某个频道（/ntfy rm 1）、暂停/恢复或开关防休眠 → 运行 scripts/ntfy_ctl.py panel / rm / pause / resume / clear / sleep 并直接展示结果表格
     - 不交出：跨对话框扫描串台的通配路由、将私密 Topic 泄露给第三方外网接口的默认行为
 ---
 
@@ -52,13 +52,18 @@ python3 ~/.agents/skills/ntfy/scripts/ntfy_ctl.py notify \
   --file "/path/to/result_image.png" \
   --file "/path/to/report.md"
 
-# 4. 查看全局防休眠、电源状态与所有已绑定频道
-python3 ~/.agents/skills/ntfy/scripts/ntfy_ctl.py status
+# 4. 打开「全局总控面板」（带 #1, #2 序号的 Markdown 表格，纵览所有已绑定的对话服务与防休眠状态）
+python3 ~/.agents/skills/ntfy/scripts/ntfy_ctl.py panel
 
-# 5. 解绑指定对话框的频道（若无剩余活跃频道将自动释放防休眠锁）
-python3 ~/.agents/skills/ntfy/scripts/ntfy_ctl.py unbind --channel "<频道ID或对话ID>"
+# 5. 按序号（如 1）、别名、会话 ID 或 Topic 删除/解绑指定对话频道（若无剩余活跃频道将自动释放防休眠锁）
+python3 ~/.agents/skills/ntfy/scripts/ntfy_ctl.py rm 1
 
-# 6. 手动切换电脑防休眠策略（auto / on / off）
+# 6. 暂停 / 恢复指定频道，或一键清空所有已绑定频道
+python3 ~/.agents/skills/ntfy/scripts/ntfy_ctl.py pause 1
+python3 ~/.agents/skills/ntfy/scripts/ntfy_ctl.py resume 1
+python3 ~/.agents/skills/ntfy/scripts/ntfy_ctl.py clear
+
+# 7. 手动切换电脑防休眠策略（auto / on / off）
 python3 ~/.agents/skills/ntfy/scripts/ntfy_ctl.py sleep --mode <auto|on|off>
 ```
 
