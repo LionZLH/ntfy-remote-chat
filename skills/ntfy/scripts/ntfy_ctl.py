@@ -1860,7 +1860,7 @@ def run_daemon_loop() -> int:
         time.sleep(3)
 
 
-WIN_MIN_DAEMON_PY = (3, 10)  # Python 3.9 在 Windows 上读取长连接消息流会卡住，后台服务至少用 3.10
+WIN_MIN_DAEMON_PY = (3, 10)  # Python 3.9 已停止维护（2025-10），Windows 后台服务优先用 3.10+（3.9 也能运行）
 
 
 def find_windows_daemon_python(current: tuple | None = None) -> str | None:
@@ -2097,9 +2097,9 @@ def cmd_bind(args: argparse.Namespace) -> int:
         )
     if IS_WIN and not find_windows_daemon_python():
         warnings.append(
-            f"Windows 上后台服务需要 Python 3.10 及以上（当前 {sys.version_info[0]}.{sys.version_info[1]}，"
-            "且没有通过 py 启动器找到更新的版本）。3.9 及更早版本可能导致手机指令延迟甚至收不到，"
-            "请从 python.org 安装 Python 3.10+ 后重新运行 bind。"
+            f"建议在 Windows 上安装 Python 3.10 及以上来运行后台服务（当前 {sys.version_info[0]}.{sys.version_info[1]} "
+            "已停止安全维护，且没有通过 py 启动器找到更新的版本）。当前版本仍可正常使用；"
+            "从 python.org 安装新版本后重新运行 bind 即可自动切换。"
         )
     if host == "gui":
         warnings.append("未识别到可自动唤醒的宿主（antigravity / claude / codex），手机指令将无法执行，只能用 notify 推送结果。")
