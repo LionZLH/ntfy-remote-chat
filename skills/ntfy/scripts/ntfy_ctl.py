@@ -15,7 +15,8 @@ ntfy_ctl.py
    电池低电量时自动释放；全部解绑后自动释放。
 4. 断线补抓与防重放：持久化 `last_event_id`，重连时 `?since=` 补抓；超过 300 秒的陈旧指令不执行，并回执告知手机。
 5. 每个频道串行执行：同一频道的指令排队逐条执行，带超时；执行失败或宿主不支持时回执告知手机。
-6. 手机端秒级元指令：`/status`、`/help`、`/pause`、`/resume`、`/sleep on|off|auto`、`/delete`。
+6. 手机端秒级元指令：`/status`、`/help`、`/pause`、`/resume`、`/cancel`、`/sleep on|off|auto`、`/delete`；
+   长任务自动推送「正在执行」进度回执，完成通知带耗时。
    电脑端总控面板：`panel`、`rm <序号>`、`pause/resume <序号>`、`clear`。
 7. 跨 IDE 投递适配器：Antigravity (`agentapi`)、Claude Code (`claude -p`)、Codex (`codex exec`)。
 """
@@ -81,6 +82,8 @@ MAX_INCOMING_BYTES = 50 * 1024 * 1024  # 手机上传附件的下载上限
 NTFY_MSG_MAX_BYTES = 3800  # ntfy 正文上限 4096 字节，超出会被服务器转成附件，留出余量
 STALE_SECONDS = 300
 DEFAULT_TASK_TIMEOUT = 1800
+PROGRESS_FIRST_SECONDS = 15  # 任务超过这么久还没完成，推一条"正在执行"回执
+DEFAULT_PROGRESS_INTERVAL = 300  # 之后每隔这么久推一次进度；0 表示关闭进度回执
 DEFAULT_MIN_BATTERY = 20
 DEFAULT_CLAUDE_PERMISSION_MODE = "acceptEdits"
 DEFAULT_CODEX_SANDBOX = "workspace-write"
@@ -997,15 +1000,77 @@ def resolve_host_bin(ch: dict, name: str) -> str | None:
     return shutil.which(name, path=clean_child_env(ch).get("PATH"))
 
 
+class TaskCancelled(Exception):
+    """手机端发送「取消」终止了当前任务"""
+
+
+# 当前执行线程的任务上下文：取消信号与开始时间（由频道执行线程设置，执行函数读取）
+_TASK_CTX = threading.local()
+
+
+def format_duration(seconds: float) -> str:
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} 秒"
+    if seconds < 3600:
+        return f"{seconds // 60} 分 {seconds % 60} 秒"
+    return f"{seconds // 3600} 小时 {seconds % 3600 // 60} 分"
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """结束进程及其启动的所有子进程（AI 运行的脚本、构建等），避免残留"""
+    try:
+        if IS_WIN:
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True, timeout=15)
+        else:
+            os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(proc.pid, signal.SIGKILL)
+    except Exception:
+        with contextlib.suppress(Exception):
+            proc.kill()
+
+
 def _run_with_timeout(
     cmd: list[str], cwd: str | None, timeout: int, env: dict | None = None, input_text: str | None = None
 ) -> subprocess.CompletedProcess:
-    """提示词经标准输入传入：避免 Windows .cmd 包装器破坏含换行/引号/& 的参数，也不受命令行长度限制"""
-    kwargs: dict = {"stdin": subprocess.DEVNULL} if input_text is None else {"input": input_text}
-    return subprocess.run(
-        cmd, cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=timeout, **kwargs,
+    """运行宿主 CLI：
+    - 提示词经标准输入传入（避免 Windows .cmd 包装器破坏含换行/引号/& 的参数，也不受命令行长度限制）；
+    - 超时或手机端「取消」时，连同子进程一起结束。"""
+    cancel = getattr(_TASK_CTX, "cancel", None)
+    popen_kw: dict = {"creationflags": 0x00000200} if IS_WIN else {"start_new_session": True}
+    proc = subprocess.Popen(
+        cmd, cwd=cwd, env=env,
+        stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace", **popen_kw,
     )
+    box: dict = {}
+
+    def _communicate() -> None:
+        try:
+            box["out"], box["err"] = proc.communicate(input_text)
+        except Exception as e:  # noqa: BLE001
+            box["err"] = repr(e)
+
+    reader = threading.Thread(target=_communicate, daemon=True)
+    reader.start()
+    deadline = time.time() + timeout
+    while True:
+        reader.join(0.5)
+        if not reader.is_alive():
+            break
+        if cancel is not None and cancel.is_set():
+            _kill_process_tree(proc)
+            reader.join(10)
+            raise TaskCancelled()
+        if time.time() > deadline:
+            _kill_process_tree(proc)
+            reader.join(10)
+            raise subprocess.TimeoutExpired(cmd, timeout)
+    return subprocess.CompletedProcess(cmd, proc.returncode, box.get("out") or "", box.get("err") or "")
 
 
 def run_claude(ch: dict, prompt: str, timeout: int) -> tuple[bool, str]:
@@ -1166,15 +1231,21 @@ def dispatch_command_to_host(
         body, problems = push_reply_files(ch, out)
         if problems:
             body += "\n\n" + "\n".join(f"- {p}" for p in problems)
-        _ch_send(ch, f"{title} | {'Claude' if host == 'claude' else 'Codex'} 执行完成", body or "执行完成。")
+        started = getattr(_TASK_CTX, "started", None)
+        took = f"（耗时 {format_duration(time.time() - started)}）" if started else ""
+        _ch_send(ch, f"{title} | {'Claude' if host == 'claude' else 'Codex'} 执行完成{took}", body or "执行完成。")
         return True, ""
 
     if host == "antigravity":
         prompt = build_prompt(channel_id, ch, clean_cmd, attachment_path, auto_reply=False)
         try:
-            return run_antigravity(ch, prompt, clean_cmd)
+            ok, detail = run_antigravity(ch, prompt, clean_cmd)
         except subprocess.TimeoutExpired:
             return False, "agentapi 投递超时"
+        if ok:
+            # Antigravity 在 IDE 里异步执行，脚本无法得知何时完成：投递成功就立即回执
+            _ch_send(ch, f"{title} | 已投递", f"指令已送达 Antigravity 对话，AI 完成后会把结果推送到这里：\n\n`{clean_cmd[:200]}`", priority=2)
+        return ok, detail
 
     return False, (
         f"当前宿主 `{host}` 不支持从手机自动唤醒（目前支持 antigravity / claude / codex）。"
@@ -1182,7 +1253,7 @@ def dispatch_command_to_host(
     )
 
 
-def handle_meta_command(channel_id: str, ch: dict, message: str) -> bool:
+def handle_meta_command(channel_id: str, ch: dict, message: str, worker: "ChannelWorker | None" = None) -> bool:
     """处理手机端秒级系统元指令（不唤醒 AI）"""
     norm = re.sub(r"\s+", " ", message.strip().lower()).strip("。！!.,，")
     title_prefix = ch.get("title") or ch.get("alias") or "远程对话"
@@ -1207,6 +1278,8 @@ def handle_meta_command(channel_id: str, ch: dict, message: str) -> bool:
             f"- 防休眠模式：{reg.get('sleep_guard', 'auto')}，锁：{caff_str}\n"
             f"- 最近指令：{ch.get('last_cmd_at') or '暂无'}"
         )
+        if worker is not None:
+            msg = f"**当前任务**\n{worker.describe_activity()}\n\n" + msg
         _ch_send(ch, f"{title_prefix} | 系统状态", msg)
         return True
 
@@ -1220,7 +1293,11 @@ def handle_meta_command(channel_id: str, ch: dict, message: str) -> bool:
             f"- `状态` / `/status`：电脑电量、防休眠与绑定状态\n"
             f"- `暂停` / `/pause`、`恢复` / `/resume`：暂停/恢复本频道\n"
             f"- `/sleep on|off|auto`：强制开启 / 关闭 / 自动防休眠\n"
-            f"- `销毁频道` / `/delete`：从电脑总控台解绑并停用本频道"
+            f"- `取消` / `/cancel`：终止正在执行的任务并清空排队\n"
+            f"- `销毁频道` / `/delete`：从电脑总控台解绑并停用本频道\n\n"
+            f"**怎么判断电脑收到了**\n"
+            f"- 任务超过 {PROGRESS_FIRST_SECONDS} 秒没完成，会收到一条静音的「正在执行」回执，之后定期推送进度；\n"
+            f"- 发出约 {PROGRESS_FIRST_SECONDS + 10} 秒后既没有结果也没有回执，说明电脑没收到（可能休眠或离线），可发送 `状态` 确认。"
         )
         _ch_send(ch, f"{title_prefix} | 指令帮助", msg)
         return True
@@ -1251,6 +1328,23 @@ def handle_meta_command(channel_id: str, ch: dict, message: str) -> bool:
         _ch_send(ch, f"{title_prefix} | 防休眠：{mode}", f"全局防休眠模式已设为 {desc}。")
         return True
 
+    if norm in ("/cancel", "cancel", "取消", "取消任务", "停止", "停止任务"):
+        _log_meta()
+        if worker is None:
+            _ch_send(ch, f"{title_prefix} | 无法取消", "当前没有可取消的任务。")
+            return True
+        running, cleared = worker.cancel_all()
+        if not running and not cleared:
+            _ch_send(ch, f"{title_prefix} | 无需取消", "当前没有正在执行或排队的任务。")
+        else:
+            parts = []
+            if running:
+                parts.append(f"正在终止：`{running[:100]}`")
+            if cleared:
+                parts.append(f"已清空排队中的 {cleared} 条指令")
+            _ch_send(ch, f"{title_prefix} | 正在取消", "\n".join(parts))
+        return True
+
     if norm in ("/delete", "/rm", "销毁频道", "删除频道"):
         _log_meta()
         with registry_txn() as reg:
@@ -1265,6 +1359,28 @@ def handle_meta_command(channel_id: str, ch: dict, message: str) -> bool:
     return False
 
 
+def iter_stream_lines(resp, stop_event: threading.Event | None = None):
+    """逐行读取 ntfy JSON 流。
+    不用 `for line in resp`（readline）：Python 3.9 及更早版本在 Windows 上按行读取分块传输的响应时，
+    会把已收到的行压在缓冲里，直到下一块数据（最长 45 秒一次的心跳）到达才交出，导致手机指令延迟甚至卡住。
+    这里用 read1 有多少读多少，自己按换行切分。"""
+    buf = b""
+    reader = getattr(resp, "read1", None)
+    while stop_event is None or not stop_event.is_set():
+        chunk = reader(65536) if reader else resp.readline()
+        if not chunk:
+            break
+        buf += chunk
+        while b"\n" in buf:
+            raw, buf = buf.split(b"\n", 1)
+            line = raw.decode("utf-8", errors="ignore").strip()
+            if line:
+                yield line
+    tail = buf.decode("utf-8", errors="ignore").strip()
+    if tail:
+        yield tail
+
+
 class ChannelWorker(threading.Thread):
     """单个频道的常驻流式监听线程 + 串行执行队列"""
 
@@ -1277,7 +1393,49 @@ class ChannelWorker(threading.Thread):
         self.tasks: queue.Queue = queue.Queue()
         self.busy = False
         self.stale_notices = 0
+        self.current: dict | None = None  # {"text": 指令, "started": 开始时间}
+        self.cancel_event = threading.Event()
         self.executor = threading.Thread(target=self._execute_loop, daemon=True)
+
+    def describe_activity(self) -> str:
+        cur = self.current
+        queued = self.tasks.qsize()
+        if cur:
+            line = f"正在执行：`{cur['text'][:80]}`（已 {format_duration(time.time() - cur['started'])}）"
+        else:
+            line = "空闲，没有正在执行的任务"
+        return line + (f"\n排队中：{queued} 条" if queued else "")
+
+    def cancel_all(self) -> tuple[str, int]:
+        """终止当前任务并清空排队，返回 (正在执行的指令, 清掉的排队条数)"""
+        cleared = 0
+        while True:
+            try:
+                self.tasks.get_nowait()
+                cleared += 1
+            except queue.Empty:
+                break
+        cur = self.current
+        if cur:
+            self.cancel_event.set()
+        return (cur["text"] if cur else ""), cleared
+
+    def _progress_loop(self, ch: dict, message: str, done: threading.Event, started: float) -> None:
+        """长任务进度回执（静音，优先级 2）：让手机端知道电脑收到了、AI 仍在生成"""
+        interval = int(ch.get("progress_interval", DEFAULT_PROGRESS_INTERVAL))
+        if interval <= 0 or ch.get("host") not in ("claude", "codex"):
+            return
+        title = ch.get("title") or ch.get("alias") or "远程对话"
+        wait = PROGRESS_FIRST_SECONDS
+        while not done.wait(wait):
+            elapsed = format_duration(time.time() - started)
+            _ch_send(
+                ch,
+                f"{title} | 正在执行（已 {elapsed}）",
+                f"电脑已收到指令，AI 仍在生成中：`{message[:100]}`\n\n完成后会推送结果；发送 `取消` 可终止。",
+                priority=2,
+            )
+            wait = interval
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -1312,15 +1470,37 @@ class ChannelWorker(threading.Thread):
                 if not ch or ch.get("status", "active") != "active":
                     continue
                 title = ch.get("title") or ch.get("alias") or "远程对话"
+                started = time.time()
+                self.cancel_event = threading.Event()
+                self.current = {"text": message, "started": started}
+                _TASK_CTX.cancel = self.cancel_event
+                _TASK_CTX.started = started
+                done = threading.Event()
+                threading.Thread(target=self._progress_loop, args=(ch, message, done, started), daemon=True).start()
+                cancelled = False
                 try:
                     ok, detail = dispatch_command_to_host(self.channel_id, ch, message, attachment_path=att_path)
-                except Exception as e:
+                except TaskCancelled:
+                    cancelled, ok, detail = True, False, ""
+                except Exception as e:  # noqa: BLE001
                     ok, detail = False, f"内部错误：{e!r}"
-                if ok:
-                    log(f"[CMD_DONE] [{self.channel_id}] {message[:60]}")
+                finally:
+                    done.set()
+                    self.current = None
+                    _TASK_CTX.cancel = None
+                    _TASK_CTX.started = None
+                elapsed = format_duration(time.time() - started)
+                if cancelled:
+                    log(f"[CMD_CANCELLED] [{self.channel_id}] {message[:60]}")
+                    _ch_send(ch, f"{title} | 已取消", f"已按手机指令终止（运行了 {elapsed}）：\n\n`{message[:200]}`")
+                elif ok:
+                    log(f"[CMD_DONE] [{self.channel_id}] {message[:60]} ({elapsed})")
                 else:
                     log(f"[CMD_FAIL] [{self.channel_id}] {detail}")
-                    _ch_send(ch, f"{title} | 指令未能执行", f"**指令**\n`{message[:200]}`\n\n**原因**\n{detail}", priority=4)
+                    _ch_send(
+                        ch, f"{title} | 指令未能执行",
+                        f"**指令**\n`{message[:200]}`\n\n**原因**\n{detail}\n\n（运行了 {elapsed}）", priority=4,
+                    )
             finally:
                 self.busy = False
 
@@ -1363,7 +1543,7 @@ class ChannelWorker(threading.Thread):
                 )
             return
 
-        if not attachment and handle_meta_command(self.channel_id, ch, message):
+        if not attachment and handle_meta_command(self.channel_id, ch, message, worker=self):
             return
 
         if ch.get("status", "active") == "paused":
@@ -1421,12 +1601,7 @@ class ChannelWorker(threading.Thread):
                 req = urllib.request.Request(stream_url, headers=headers)
                 with urllib.request.urlopen(req, timeout=90) as resp:
                     backoff = 3
-                    for raw_line in resp:
-                        if self.stop_event.is_set():
-                            break
-                        line = raw_line.decode("utf-8", errors="ignore").strip()
-                        if not line:
-                            continue
+                    for line in iter_stream_lines(resp, self.stop_event):
                         try:
                             ev = json.loads(line)
                         except Exception:
@@ -1868,6 +2043,7 @@ def cmd_bind(args: argparse.Namespace) -> int:
         "permission_mode": pick(args.permission_mode, "permission_mode", DEFAULT_CLAUDE_PERMISSION_MODE),
         "codex_sandbox": pick(args.codex_sandbox, "codex_sandbox", DEFAULT_CODEX_SANDBOX),
         "task_timeout": int(pick(args.task_timeout, "task_timeout", DEFAULT_TASK_TIMEOUT)),
+        "progress_interval": int(pick(args.progress_interval, "progress_interval", DEFAULT_PROGRESS_INTERVAL)),
         "host_bin": shutil.which(host) or "" if host in ("claude", "codex") else "",
         "own_session_id": existing_ch.get("own_session_id", ""),
         "own_session_created": bool(existing_ch.get("own_session_created")),
@@ -1918,7 +2094,8 @@ def cmd_bind(args: argparse.Namespace) -> int:
             f"**使用方法**\n"
             f"- 直接打字或点回形针发图片/文件即可唤醒电脑执行（按顺序逐条执行）；\n"
             f"- 电脑产出的图片、PDF、视频等会直接发回本频道；\n"
-            f"- 发送 `状态` 查看电脑状态，`帮助` 查看全部指令，`销毁频道` 立即解绑。\n\n"
+            f"- 任务超过 {PROGRESS_FIRST_SECONDS} 秒会先收到「正在执行」回执；发送 `取消` 可终止；\n"
+            f"- 发送 `状态` 查看电脑与当前任务，`帮助` 查看全部指令，`销毁频道` 立即解绑。\n\n"
             f"**安全警示**\n"
             f"请勿向任何人分享、转发或截图暴露本频道的二维码、Topic 与订阅链接（持有即可读取消息并远程控制当前对话）。"
         )
@@ -2214,6 +2391,10 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Codex 执行手机指令时的沙箱（默认 {DEFAULT_CODEX_SANDBOX}）",
     )
     p_bind.add_argument("--task-timeout", type=int, default=None, help=f"单条指令最长执行秒数（默认 {DEFAULT_TASK_TIMEOUT}）")
+    p_bind.add_argument(
+        "--progress-interval", type=int, default=None,
+        help=f"长任务进度回执间隔秒数（默认 {DEFAULT_PROGRESS_INTERVAL}；任务超过 {PROGRESS_FIRST_SECONDS} 秒先回执一次；0 关闭）",
+    )
     p_bind.add_argument("--no-test", action="store_true", help="绑定时不发送初始测试通知")
     p_bind.add_argument("--dry-run", action="store_true", help="仅预览配置，不写入也不启动守护进程")
 

@@ -420,6 +420,72 @@ class NetworkTests(unittest.TestCase):
             w.stop()
         self.assertTrue(ok, calls)
 
+    def test_progress_receipts_for_long_task(self):
+        """长任务：先推「正在执行」静音回执，再按间隔推进度，完成后照常出结果"""
+        cid, ch = make_channel(self.srv.url, self.ws, progress_interval=1)
+
+        def slow(c, chh, m, attachment_path=None):
+            time.sleep(2.3)
+            return True, ""
+
+        with mock.patch.object(ntfy, "PROGRESS_FIRST_SECONDS", 0.5), \
+                mock.patch.object(ntfy, "dispatch_command_to_host", side_effect=slow):
+            w = ntfy.ChannelWorker(cid, ch)
+            w.start()
+            self.srv.push(ch["topic"], message="慢任务")
+            self.assertTrue(wait_for(lambda: w.current is not None, 5))
+            # 执行期间发「状态」：能看到当前任务
+            self.srv.push(ch["topic"], message="状态")
+            self.assertTrue(wait_for(lambda: any("系统状态" in m["title"] for m in self.srv.json_msgs()), 5))
+            self.assertTrue(wait_for(lambda: w.current is None, 10))
+            w.stop()
+        progress = [m for m in self.srv.json_msgs() if "正在执行" in m["title"]]
+        self.assertGreaterEqual(len(progress), 2)
+        self.assertTrue(all(m["priority"] == 2 for m in progress))
+        status = [m for m in self.srv.json_msgs() if "系统状态" in m["title"]][0]["message"]
+        self.assertIn("正在执行：`慢任务`", status)
+
+    def test_cancel_running_task(self):
+        """手机发「取消」：终止正在运行的 AI 进程并清空排队"""
+        bindir = make_fake_cli("claude", "import time\ntime.sleep(60)\nprint('不应该出现')\n")
+        cid, ch = make_channel(self.srv.url, self.ws, progress_interval=0)
+        with mock.patch.dict(os.environ, {"PATH": with_path(bindir)}):
+            w = ntfy.ChannelWorker(cid, ch)
+            w.start()
+            self.srv.push(ch["topic"], message="长任务")
+            self.assertTrue(wait_for(lambda: w.current is not None, 5))
+            self.srv.push(ch["topic"], message="排队任务")
+            self.assertTrue(wait_for(lambda: w.tasks.qsize() == 1, 5))
+            t0 = time.time()
+            self.srv.push(ch["topic"], message="取消")
+            self.assertTrue(wait_for(lambda: any("已取消" in m["title"] for m in self.srv.json_msgs()), 20))
+            self.assertLess(time.time() - t0, 20)
+            self.assertTrue(wait_for(lambda: w.current is None, 5))
+            w.stop()
+        titles = [m["title"] for m in self.srv.json_msgs()]
+        self.assertTrue(any("正在取消" in x for x in titles))
+        cancel_msg = [m for m in self.srv.json_msgs() if "正在取消" in m["title"]][0]["message"]
+        self.assertIn("已清空排队中的 1 条指令", cancel_msg)
+        self.assertFalse(any("执行完成" in x for x in titles))
+        self.assertEqual(len(fake_calls(bindir)), 1)  # 排队的那条没有被执行
+
+    def test_timeout_kills_process(self):
+        t0 = time.time()
+        with self.assertRaises(subprocess.TimeoutExpired):
+            ntfy._run_with_timeout([sys.executable, "-c", "import time; time.sleep(30)"], None, 1)
+        self.assertLess(time.time() - t0, 15)
+
+    def test_iter_stream_lines_split_chunks(self):
+        class FakeResp:
+            def __init__(self, parts):
+                self.parts = list(parts)
+
+            def read1(self, n):
+                return self.parts.pop(0) if self.parts else b""
+
+        parts = [b'{"a":1}\n{"b"', b':2}\n', b"\n", "{\"中\":3}".encode("utf-8")[:4], "{\"中\":3}\n".encode("utf-8")[4:]]
+        self.assertEqual(list(ntfy.iter_stream_lines(FakeResp(parts))), ['{"a":1}', '{"b":2}', '{"中":3}'])
+
     def test_worker_reports_failure(self):
         cid, ch = make_channel(self.srv.url, self.ws, host="gui")
         w = ntfy.ChannelWorker(cid, ch)

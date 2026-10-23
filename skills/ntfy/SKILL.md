@@ -87,7 +87,7 @@ NTFY uninstall [--purge]
    - 订阅信息：**Topic**（单独一行，方便 iPhone 用户复制）、Android 深链 `channel.app_url`、网页链接 `channel.web_url`，以及 `qr_codes` 里的二维码路径；
    - 按输出中的 `subscribe_guide` 分别说明 Android 与 iPhone 的订阅步骤：Android 点 `ntfy://` 链接或扫 Android 二维码即可直接打开 App 订阅；**iPhone 版 App 不支持链接拉起，只能在 App 里点 + 手动粘贴 Topic**；
    - 守护进程与防休眠状态，MacBook 合盖会睡眠的提醒；
-   - 手机端用法：直接发文字或图片/文件；`状态` `/status`、`暂停` `/pause`、`恢复` `/resume`、`销毁频道` `/delete`、`帮助` `/help`、`/sleep on|off|auto`；
+   - 手机端用法：直接发文字或图片/文件；`状态` `/status`、`暂停` `/pause`、`恢复` `/resume`、`取消` `/cancel`、`销毁频道` `/delete`、`帮助` `/help`、`/sleep on|off|auto`；并说明：任务超过 15 秒会收到「正在执行」静音回执，发出后 25 秒以上没有任何回执说明电脑没收到；
    - **安全警告（每次绑定必带）**：转述输出中的 `security_warning` 与全部 `warnings`——切勿分享、转发或截图暴露二维码、Topic 与订阅链接；泄露后立即发送 `销毁频道` 或执行 `/ntfy rm <序号>`，再 `bind --rotate`。
 
 ### 场景三：用户输入 `/ntfy panel`、`/ntfy rm 1`、`/ntfy pause 1`、`/ntfy clear`
