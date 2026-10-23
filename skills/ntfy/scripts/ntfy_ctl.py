@@ -1296,7 +1296,9 @@ def cmd_bind(args: argparse.Namespace) -> int:
             f"**使用方法**\n"
             f"- 直接打字或点回形针发图片/文件即可唤醒电脑执行；\n"
             f"- 电脑产出的图片、PDF、视频等也会直接发回本频道预览；\n"
-            f"- 发送 `状态` 查看电脑电量与防休眠状态。"
+            f"- 发送 `状态` 查看电脑电量与防休眠状态；发送 `销毁频道` 可立即解绑。\n\n"
+            f"**安全警示与免责提示**\n"
+            f"请勿向任何人分享、转发或截图暴露本频道的二维码、Topic 与订阅链接（持有该链接即拥有当前电脑对话的远程控制权）。"
         )
         test_sent = send_ntfy_message(
             server=server,
@@ -1315,6 +1317,10 @@ def cmd_bind(args: argparse.Namespace) -> int:
         "test_notification_sent": test_sent,
         "daemon": daemon_info,
         "power_and_sleep": power_info,
+        "security_warning": (
+            "严禁分享二维码、Topic 或订阅链接！该链接等同于电脑当前 AI 对话框的免密远程控制密钥，"
+            "泄露将导致他人可查看你的通知并向电脑远程发送执行指令。若不慎暴露，请立即发送「销毁频道」或运行 `/ntfy rm` 作废。"
+        ),
     }
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0
@@ -1446,10 +1452,12 @@ def cmd_panel(_args: argparse.Namespace) -> int:
             [
                 "",
                 "**快捷管理指令：**",
-                "- 删除指定频道：`/ntfy rm 1`（或 `python3 ~/.gemini/config/skills/ntfy/scripts/ntfy_ctl.py rm 1`）",
+                "- 删除指定频道：`/ntfy rm 1`（或 `python3 ~/.agents/skills/ntfy/scripts/ntfy_ctl.py rm 1`）",
                 "- 暂停/恢复频道：`/ntfy pause 1` / `/ntfy resume 1`（或在手机端直接发 `暂停` / `恢复`）",
                 "- 手机端自毁当前频道：在手机 ntfy 频道内直接发送 `销毁频道` 或 `/delete`",
                 "- 清空全部频道：`/ntfy clear`",
+                "",
+                "> **安全警示与免责提示**：上表中的「专属 Topic」及对应二维码/订阅链接等同于你电脑对应 AI 对话框的**免密远程控制密钥**。**切勿向他人分享、转发或在公开截图中暴露！**若不慎泄露，请立即执行 `/ntfy rm <序号>` 或在手机发送 `销毁频道` 作废。",
             ]
         )
 
