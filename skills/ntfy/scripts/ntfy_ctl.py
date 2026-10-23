@@ -363,8 +363,8 @@ def get_battery_info() -> tuple[bool | None, int | None]:
                 percent = int(m.group(1))
         elif IS_LINUX:
             for bat in sorted(Path("/sys/class/power_supply").glob("BAT*")):
-                cap = (bat / "capacity").read_text().strip()
-                status = (bat / "status").read_text().strip().lower()
+                cap = (bat / "capacity").read_text(encoding="ascii").strip()
+                status = (bat / "status").read_text(encoding="ascii").strip().lower()
                 percent = int(cap)
                 on_battery = status == "discharging"
                 break
@@ -889,26 +889,67 @@ def build_prompt(channel_id: str, ch: dict, clean_cmd: str, attachment_path: Pat
     )
 
 
-def _run_with_timeout(cmd: list[str], cwd: str | None, timeout: int, env: dict | None = None) -> subprocess.CompletedProcess:
+# 从当前 IDE 会话继承来的标记变量：传给子进程会让 CLI 误以为自己嵌套在别的会话里
+_INHERITED_SESSION_VARS = (
+    "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SSE_PORT", "CODEX_THREAD_ID", "CODEX_SESSION_IDS", "CODEX_TOOL_CALL_ID",
+    "ANTIGRAVITY_CONVERSATION_ID",
+)
+
+
+def clean_child_env(ch: dict | None = None) -> dict:
+    """子进程环境：去掉会话标记变量；补上绑定时记录的 PATH（launchd/systemd 的 PATH 很精简，nvm 装的 CLI 会找不到）"""
+    env = {k: v for k, v in os.environ.items() if k not in _INHERITED_SESSION_VARS}
+    bind_path = (ch or {}).get("env_path", "")
+    if bind_path:
+        parts = env.get("PATH", "").split(os.pathsep) if env.get("PATH") else []
+        for d in bind_path.split(os.pathsep):
+            if d and d not in parts:
+                parts.append(d)
+        env["PATH"] = os.pathsep.join(parts)
+    return env
+
+
+def is_auto_conv_id(ch: dict) -> bool:
+    """会话 ID 是否为自动生成的占位值（兼容 1.1 版本没有 conv_id_auto 字段的旧频道）"""
+    if "conv_id_auto" in ch:
+        return bool(ch["conv_id_auto"])
+    conv_id = ch.get("conv_id", "")
+    return not conv_id or conv_id in ("auto", "new") or conv_id == f"{ch.get('host', '')}-{ch.get('alias', '')}"
+
+
+def resolve_host_bin(ch: dict, name: str) -> str | None:
+    """优先用绑定时记录的绝对路径，其次在（补全后的）PATH 中查找"""
+    saved = ch.get("host_bin", "")
+    if saved and Path(saved).is_file():
+        return saved
+    return shutil.which(name, path=clean_child_env(ch).get("PATH"))
+
+
+def _run_with_timeout(
+    cmd: list[str], cwd: str | None, timeout: int, env: dict | None = None, input_text: str | None = None
+) -> subprocess.CompletedProcess:
+    """提示词经标准输入传入：避免 Windows .cmd 包装器破坏含换行/引号/& 的参数，也不受命令行长度限制"""
+    kwargs: dict = {"stdin": subprocess.DEVNULL} if input_text is None else {"input": input_text}
     return subprocess.run(
         cmd, cwd=cwd, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
-        timeout=timeout, stdin=subprocess.DEVNULL,
+        timeout=timeout, **kwargs,
     )
 
 
 def run_claude(ch: dict, prompt: str, timeout: int) -> tuple[bool, str]:
-    exe = shutil.which("claude")
+    exe = resolve_host_bin(ch, "claude")
     if not exe:
-        return False, "本机未找到 claude 命令"
+        return False, "后台进程找不到 claude 命令，请在装有 claude 的终端里重新运行 bind"
     workspace = ch.get("workspace", str(HOME))
     conv_id = ch.get("conv_id", "")
     cmd = [exe]
-    if conv_id and not ch.get("conv_id_auto"):
+    if conv_id and not is_auto_conv_id(ch):
         cmd += ["--resume", conv_id]
     else:
         cmd += ["--continue"]
-    cmd += ["--permission-mode", ch.get("permission_mode") or DEFAULT_CLAUDE_PERMISSION_MODE, "-p", prompt]
-    res = _run_with_timeout(cmd, workspace, timeout)
+    cmd += ["--permission-mode", ch.get("permission_mode") or DEFAULT_CLAUDE_PERMISSION_MODE, "-p"]
+    res = _run_with_timeout(cmd, workspace, timeout, env=clean_child_env(ch), input_text=prompt)
     out = (res.stdout or "").strip()
     if res.returncode != 0:
         return False, (res.stderr or out or f"claude 退出码 {res.returncode}").strip()[-1500:]
@@ -916,11 +957,12 @@ def run_claude(ch: dict, prompt: str, timeout: int) -> tuple[bool, str]:
 
 
 def run_codex(ch: dict, prompt: str, timeout: int) -> tuple[bool, str]:
-    exe = shutil.which("codex")
+    exe = resolve_host_bin(ch, "codex")
     if not exe:
-        return False, "本机未找到 codex 命令"
+        return False, "后台进程找不到 codex 命令，请在装有 codex 的终端里重新运行 bind"
     workspace = ch.get("workspace", str(HOME))
     conv_id = ch.get("conv_id", "")
+    env = clean_child_env(ch)
     fd, last_msg_path = tempfile.mkstemp(prefix="ntfy_codex_", suffix=".txt")
     os.close(fd)
     base = [
@@ -929,16 +971,16 @@ def run_codex(ch: dict, prompt: str, timeout: int) -> tuple[bool, str]:
         "--output-last-message", last_msg_path,
     ]
     try:
-        attempts = []
-        if conv_id and not ch.get("conv_id_auto"):
-            attempts.append(base + ["resume", conv_id, prompt])  # 续接原会话
-        attempts.append(base + [prompt])  # 续接失败时退回新会话
         res = None
-        for cmd in attempts:
-            res = _run_with_timeout(cmd, workspace, timeout)
-            if res.returncode == 0:
-                break
-        assert res is not None
+        if conv_id and not is_auto_conv_id(ch):
+            res = _run_with_timeout(base + ["resume", conv_id, "-"], workspace, timeout, env=env, input_text=prompt)
+            err = (res.stderr or "").lower()
+            # 只有"会话不存在"或参数不被接受时才改开新会话；其他失败直接上报，避免同一任务被执行两遍
+            if res.returncode != 0 and (res.returncode == 2 or "no rollout found" in err or "not found" in err):
+                log(f"[WARN] Codex 会话 {conv_id} 无法续接，改为新会话执行")
+                res = None
+        if res is None:
+            res = _run_with_timeout(base + ["-"], workspace, timeout, env=env, input_text=prompt)
         try:
             last_msg = Path(last_msg_path).read_text(encoding="utf-8", errors="replace").strip()
         except Exception:
@@ -958,7 +1000,7 @@ def run_antigravity(ch: dict, prompt: str, clean_cmd: str) -> tuple[bool, str]:
     env = get_agy_env()
     conv_id = ch.get("conv_id", "")
     title = ch.get("title") or ch.get("alias") or "远程对话"
-    if conv_id and not ch.get("conv_id_auto"):
+    if conv_id and not is_auto_conv_id(ch):
         res = _run_with_timeout(
             [str(AGENTAPI_BIN), "send-message", "--title", "手机远程指令", conv_id, prompt], None, 120, env
         )
@@ -1381,6 +1423,8 @@ def run_daemon_loop() -> int:
     workers: dict[str, tuple[str, ChannelWorker]] = {}
     inhibitor_proc: subprocess.Popen | None = None
     win_inhibiting = False
+    inhibitor_started_at = 0.0
+    inhibitor_retry_at = 0.0  # 防休眠子进程启动即退出（如无 logind）时，暂停重试，避免每 3 秒刷屏
     battery_cache: tuple[float, bool | None, int | None] = (0.0, None, None)
 
     def _shutdown() -> None:
@@ -1433,11 +1477,17 @@ def run_daemon_loop() -> int:
                         win_inhibiting = True
                         INHIBITOR_PID_PATH.write_text(str(os.getpid()), encoding="utf-8")
                         log("[SLEEP_GUARD_ON] 已激活防休眠 (SetThreadExecutionState)")
-                elif inhibitor_proc is None or inhibitor_proc.poll() is not None:
-                    inhibitor_proc = start_sleep_inhibitor()
-                    if inhibitor_proc:
-                        INHIBITOR_PID_PATH.write_text(str(inhibitor_proc.pid), encoding="utf-8")
-                        log(f"[SLEEP_GUARD_ON] 已激活防休眠锁 (PID={inhibitor_proc.pid})")
+                elif (inhibitor_proc is None or inhibitor_proc.poll() is not None) and now >= inhibitor_retry_at:
+                    if inhibitor_proc is not None and now - inhibitor_started_at < 10:
+                        inhibitor_retry_at = now + 300
+                        inhibitor_proc = None
+                        log("[SLEEP_GUARD_UNAVAILABLE] 防休眠进程启动后立即退出，本机可能不支持，5 分钟后重试")
+                    else:
+                        inhibitor_proc = start_sleep_inhibitor()
+                        inhibitor_started_at = now
+                        if inhibitor_proc:
+                            INHIBITOR_PID_PATH.write_text(str(inhibitor_proc.pid), encoding="utf-8")
+                            log(f"[SLEEP_GUARD_ON] 已激活防休眠锁 (PID={inhibitor_proc.pid})")
             else:
                 if inhibitor_proc is not None or win_inhibiting:
                     log("[SLEEP_GUARD_OFF] 已释放防休眠锁")
@@ -1476,7 +1526,7 @@ def _spawn_background_daemon(script_abs: str) -> int:
         kwargs["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000  # DETACHED | NEW_GROUP | NO_WINDOW
     else:
         kwargs["start_new_session"] = True
-    proc = subprocess.Popen([_daemon_python(), script_abs, "daemon"], **kwargs)
+    proc = subprocess.Popen([_daemon_python(), script_abs, "daemon"], env=clean_child_env(), **kwargs)
     return proc.pid
 
 
@@ -1529,6 +1579,10 @@ def ensure_background_daemon() -> dict:
 \t<string>{STATE_DIR}</string>
 \t<key>EnvironmentVariables</key>
 \t<dict>
+\t\t<key>HOME</key>
+\t\t<string>{HOME}</string>
+\t\t<key>PYTHONIOENCODING</key>
+\t\t<string>utf-8</string>
 \t\t<key>PATH</key>
 \t\t<string>{HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 \t</dict>
@@ -1553,6 +1607,7 @@ def ensure_background_daemon() -> dict:
         unit = (
             "[Unit]\nDescription=ntfy remote chat hub\nAfter=network-online.target\n\n"
             "[Service]\n"
+            f"Environment=\"HOME={HOME}\" \"PYTHONIOENCODING=utf-8\"\n"
             f"ExecStart=\"{sys.executable}\" \"{script_abs}\" daemon\n"
             "Restart=on-failure\nRestartSec=5\n\n"
             "[Install]\nWantedBy=default.target\n"
@@ -1579,13 +1634,25 @@ def ensure_background_daemon() -> dict:
             with contextlib.suppress(Exception):
                 WIN_STARTUP_PATH.parent.mkdir(parents=True, exist_ok=True)
                 WIN_STARTUP_PATH.write_text(
-                    f'@echo off\r\nstart "" "{_daemon_python()}" "{script_abs}" daemon\r\n', encoding="utf-8"
+                    f'@echo off\r\nchcp 65001 >nul\r\nstart "" "{_daemon_python()}" "{script_abs}" daemon\r\n',
+                    encoding="utf-8",
                 )
                 info["service_config"] = str(WIN_STARTUP_PATH)
         if not is_daemon_running():
             _spawn_background_daemon(script_abs)
             time.sleep(1.0)
         info["manager"] = "background-process"
+
+    if info.get("manager") in ("launchd", "systemd-user"):
+        for _ in range(20):
+            if is_daemon_running():
+                break
+            time.sleep(0.25)
+        if not is_daemon_running():
+            _spawn_background_daemon(script_abs)
+            time.sleep(1.0)
+            info["note"] = f"{info['manager']} 未能拉起守护进程，已改为普通后台进程运行（重启电脑后需重新 bind）"
+            info["manager"] = "background-process"
 
     pid = read_pid(PID_FILE_PATH)
     info["hub_pid"] = str(pid) if pid and is_pid_alive(pid) else None
@@ -1694,6 +1761,8 @@ def cmd_bind(args: argparse.Namespace) -> int:
         "permission_mode": pick(args.permission_mode, "permission_mode", DEFAULT_CLAUDE_PERMISSION_MODE),
         "codex_sandbox": pick(args.codex_sandbox, "codex_sandbox", DEFAULT_CODEX_SANDBOX),
         "task_timeout": int(pick(args.task_timeout, "task_timeout", DEFAULT_TASK_TIMEOUT)),
+        "host_bin": shutil.which(host) or "" if host in ("claude", "codex") else "",
+        "env_path": os.environ.get("PATH", ""),
         "status": "active",
         "created_at": existing_ch.get("created_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1868,7 +1937,7 @@ def cmd_panel(_args: argparse.Namespace) -> int:
             status_str = "运行中" if ch.get("status", "active") == "active" else "已暂停"
             title = ch.get("title") or ch.get("alias") or ch.get("channel_id")
             conv_id = ch.get("conv_id") or "-"
-            if ch.get("conv_id_auto"):
+            if is_auto_conv_id(ch):
                 conv_id += "（自动）"
             last_cmd = (ch.get("last_cmd_text") or "-").replace("|", "\\|").replace("\n", " ")
             if len(last_cmd) > 24:
@@ -2072,7 +2141,16 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _force_utf8_stdio() -> None:
+    """输出统一 UTF-8：英文 Windows 上管道输出默认 cp1252，打印中文会直接报错"""
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(Exception):
+            if stream and (stream.encoding or "").lower().replace("-", "") != "utf8":
+                stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main(argv: list[str] | None = None) -> int:
+    _force_utf8_stdio()
     args = build_parser().parse_args(argv)
     if args.subcommand == "bind":
         return cmd_bind(args)

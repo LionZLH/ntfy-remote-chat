@@ -26,6 +26,8 @@ SCRIPT = ROOT / "skills" / "ntfy" / "scripts" / "ntfy_ctl.py"
 # 在导入前把 HOME 指到临时目录，避免污染真实状态
 TMP_HOME = tempfile.mkdtemp(prefix="ntfy_test_home_")
 os.environ["HOME"] = TMP_HOME
+os.environ["USERPROFILE"] = TMP_HOME  # Windows 上 Path.home() 读取 USERPROFILE
+os.environ["APPDATA"] = os.path.join(TMP_HOME, "AppData")
 os.environ.pop("CLAUDECODE", None)
 os.environ.pop("CLAUDE_CODE_SESSION_ID", None)
 
@@ -128,6 +130,37 @@ class FakeNtfy:
         self.httpd.shutdown()
 
 
+IS_WIN = sys.platform == "win32"
+
+
+def make_fake_cli(name: str, body: str) -> Path:
+    """生成假的 CLI：记录 argv、stdin 与 CLAUDECODE 到 calls.jsonl，再执行 body。返回所在目录。"""
+    bindir = Path(tempfile.mkdtemp(prefix="fakebin_"))
+    log_path = bindir / "calls.jsonl"
+    code = (
+        "import json,os,sys\n"
+        "stdin=sys.stdin.read()\n"
+        f"open({str(log_path)!r},'a',encoding='utf-8').write(json.dumps({{'argv':sys.argv[1:],'stdin':stdin,"
+        "'claudecode':os.environ.get('CLAUDECODE')}, ensure_ascii=False)+'\\n')\n" + body
+    )
+    if IS_WIN:
+        (bindir / f"{name}.py").write_text(code, encoding="utf-8")
+        (bindir / f"{name}.cmd").write_text(f'@"{sys.executable}" "%~dp0{name}.py" %*\r\n', encoding="utf-8")
+    else:
+        fake = bindir / name
+        fake.write_text(f"#!{sys.executable}\n" + code, encoding="utf-8")
+        fake.chmod(0o755)
+    return bindir
+
+
+def fake_calls(bindir: Path) -> list:
+    return [json.loads(l) for l in (bindir / "calls.jsonl").read_text(encoding="utf-8").splitlines()]
+
+
+def with_path(bindir: Path) -> str:
+    return f"{bindir}{os.pathsep}{os.environ['PATH']}"
+
+
 def wait_for(cond, timeout=10.0):
     end = time.time() + timeout
     while time.time() < end:
@@ -215,6 +248,7 @@ class RegistryTests(unittest.TestCase):
         self.assertIsNone(ntfy.update_channel(cid, last_event_id="abc"))
         self.assertNotIn(cid, ntfy.load_registry()["channels"])
 
+    @unittest.skipIf(IS_WIN, "POSIX 文件权限")
     def test_registry_private(self):
         make_channel("http://x", TMP_HOME)
         mode = os.stat(ntfy.REGISTRY_PATH).st_mode & 0o777
@@ -260,7 +294,7 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(ntfy.main(["notify", "--channel", "typo-conversation-id", "--msg", "x"]), 1)
         # 敏感文件：拒绝
         env = Path(self.ws) / ".env"
-        env.write_text("SECRET=1")
+        env.write_text("SECRET=1", encoding="utf-8")
         self.assertEqual(ntfy.main(["notify", "--channel", cid, "--file", str(env)]), 1)
         # 字面 \n 转换
         self.assertEqual(ntfy.main(["notify", "--channel", cid, "--msg", "第一行\\n第二行"]), 0)
@@ -290,7 +324,7 @@ class NetworkTests(unittest.TestCase):
         self.assertNotIn("机器人", msgs)
         self.assertEqual(calls[1], ("外部附件", None))  # 外部附件被拒绝，仅文字照常执行
         self.assertIn("up.txt", msgs[2])
-        self.assertEqual(calls[2][1].read_text(), "hello")
+        self.assertEqual(calls[2][1].read_text(encoding="utf-8"), "hello")
         self.assertTrue((Path(self.ws) / ".ntfy_inbox" / ".gitignore").is_file())
         titles = [m["title"] for m in self.srv.json_msgs()]
         self.assertTrue(any("已过期未执行" in t for t in titles))
@@ -308,30 +342,69 @@ class NetworkTests(unittest.TestCase):
         self.assertTrue(ok)
 
     def test_claude_dispatch(self):
-        bindir = Path(tempfile.mkdtemp(prefix="fakebin_"))
-        argv_log = bindir / "argv.json"
         out_img = Path(self.ws) / "out.png"
         out_img.write_bytes(b"\x89PNG")
-        fake = bindir / "claude"
-        fake.write_text(
-            "#!/usr/bin/env python3\nimport json,sys\n"
-            f"json.dump(sys.argv[1:], open({str(argv_log)!r},'w'))\n"
-            f"print('完成了\\nNTFY_FILE: {out_img}\\nNTFY_FILE: /etc/passwd')\n"
-        )
-        fake.chmod(0o755)
+        outside = Path(TMP_HOME) / "outside.txt"
+        outside.write_text("x", encoding="utf-8")
+        reply = f"完成了\nNTFY_FILE: {out_img}\nNTFY_FILE: {outside}"
+        bindir = make_fake_cli("claude", f"print({reply!r})\n")
         cid, ch = make_channel(self.srv.url, self.ws)
-        with mock.patch.dict(os.environ, {"PATH": f"{bindir}:{os.environ['PATH']}"}):
-            ok, detail = ntfy.dispatch_command_to_host(cid, ch, "画图")
+        env = {"PATH": with_path(bindir), "CLAUDECODE": "1"}
+        with mock.patch.dict(os.environ, env):
+            ok, detail = ntfy.dispatch_command_to_host(cid, ch, "画图 & \"引号\"")
         self.assertTrue(ok, detail)
-        argv = json.loads(argv_log.read_text())
+        call = fake_calls(bindir)[0]
+        argv = call["argv"]
         self.assertIn("--continue", argv)  # conv_id 是自动生成的，不能 --resume
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "acceptEdits")
+        self.assertEqual(argv[-1], "-p")  # 提示词不在命令行参数里
+        self.assertIn("画图 & \"引号\"", call["stdin"])  # 而是经标准输入原样传入
+        self.assertIsNone(call["claudecode"])  # 不继承当前会话标记
         puts = [p for p in self.srv.published if p["kind"] == "put"]
         self.assertEqual(len(puts), 1)  # 只推送了工作目录内的图片
         final = self.srv.json_msgs()[-1]["message"]
         self.assertIn("完成了", final)
         self.assertNotIn("NTFY_FILE", final)
         self.assertIn("已拒绝工作目录外的文件", final)
+
+    def test_claude_found_via_bind_path(self):
+        bindir = make_fake_cli("claude", "print('ok')\n")
+        cid, ch = make_channel(self.srv.url, self.ws, env_path=str(bindir), conv_id="real-id", conv_id_auto=False)
+        with mock.patch.dict(os.environ, {"PATH": str(Path(TMP_HOME) / "empty_bin")}):  # 模拟 launchd 精简 PATH
+            ok, detail = ntfy.dispatch_command_to_host(cid, ch, "hi")
+        self.assertTrue(ok, detail)
+        self.assertEqual(fake_calls(bindir)[0]["argv"][:2], ["--resume", "real-id"])
+
+    def test_codex_resume_fallback_rules(self):
+        # 会话不存在：退回新会话
+        bindir = make_fake_cli(
+            "codex",
+            "if 'resume' in sys.argv:\n    sys.stderr.write('Error: no rollout found for thread id x'); sys.exit(1)\n"
+            "out=sys.argv[sys.argv.index('--output-last-message')+1]\nopen(out,'w').write('新会话完成')\n",
+        )
+        cid, ch = make_channel(self.srv.url, self.ws, host="codex", conv_id="t-1", conv_id_auto=False)
+        with mock.patch.dict(os.environ, {"PATH": with_path(bindir)}):
+            ok, detail = ntfy.dispatch_command_to_host(cid, ch, "任务")
+        self.assertTrue(ok, detail)
+        calls = fake_calls(bindir)
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["argv"][-3:], ["resume", "t-1", "-"])
+        self.assertEqual(calls[1]["argv"][-1], "-")
+        self.assertIn("任务", calls[1]["stdin"])
+        self.assertIn("新会话完成", self.srv.json_msgs()[-1]["message"])
+
+        # 其他失败：直接上报，不重复执行
+        bindir2 = make_fake_cli("codex", "sys.stderr.write('model error'); sys.exit(1)\n")
+        with mock.patch.dict(os.environ, {"PATH": with_path(bindir2)}):
+            ok, detail = ntfy.dispatch_command_to_host(cid, ch, "任务")
+        self.assertFalse(ok)
+        self.assertIn("model error", detail)
+        self.assertEqual(len(fake_calls(bindir2)), 1)
+
+    def test_legacy_channel_auto_conv_id(self):
+        self.assertTrue(ntfy.is_auto_conv_id({"host": "claude", "alias": "proj", "conv_id": "claude-proj"}))
+        self.assertFalse(ntfy.is_auto_conv_id({"host": "claude", "alias": "proj", "conv_id": "3f2a-uuid"}))
+        self.assertFalse(ntfy.is_auto_conv_id({"conv_id": "claude-proj", "conv_id_auto": False}))
 
 
 class PanelTests(unittest.TestCase):
@@ -390,13 +463,14 @@ class PromptTests(unittest.TestCase):
 
 class DaemonTests(unittest.TestCase):
     def test_single_instance(self):
-        env = dict(os.environ, HOME=tempfile.mkdtemp(prefix="ntfy_daemon_home_"))
+        home = tempfile.mkdtemp(prefix="ntfy_daemon_home_")
+        env = dict(os.environ, HOME=home, USERPROFILE=home)
         p1 = subprocess.Popen([sys.executable, str(SCRIPT), "daemon"], env=env,
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8")
         try:
             time.sleep(1.5)
             p2 = subprocess.run([sys.executable, str(SCRIPT), "daemon"], env=env,
-                                capture_output=True, text=True, timeout=10)
+                                capture_output=True, text=True, encoding="utf-8", timeout=10)
             self.assertEqual(p2.returncode, 0)
             self.assertIn("HUB_SKIP", p2.stdout)
             self.assertIsNone(p1.poll())
@@ -407,7 +481,7 @@ class DaemonTests(unittest.TestCase):
     def test_bind_dry_run_warnings(self):
         r = subprocess.run(
             [sys.executable, str(SCRIPT), "bind", "--host", "claude", "--workspace", TMP_HOME, "--dry-run"],
-            capture_output=True, text=True, timeout=30, env=dict(os.environ),
+            capture_output=True, text=True, encoding="utf-8", timeout=30, env=dict(os.environ),
         )
         out = json.loads(r.stdout)
         self.assertTrue(out["channel"]["conv_id_auto"])
