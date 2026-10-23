@@ -42,6 +42,8 @@ class FakeNtfy:
     def __init__(self):
         self.published: list[dict] = []
         self.streams: dict[str, queue.Queue] = {}
+        self.poll_events: dict[str, list] = {}  # 只能通过 poll 补查拿到的消息（模拟服务器缓存延迟）
+        self.poll_count = 0
         self.files: dict[str, bytes] = {}
         self.auth_seen: list[str] = []
         owner = self
@@ -93,6 +95,14 @@ class FakeNtfy:
                     self.wfile.write(data)
                     return
                 topic = self.path.split("/")[1]
+                if "poll=1" in self.path:
+                    owner.poll_count += 1
+                    body = "".join(json.dumps(ev) + "\n" for ev in owner.poll_events.get(topic, [])).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
                 q = owner.streams.setdefault(topic, queue.Queue())
                 self.send_response(200)
                 self.send_header("Content-Type", "application/x-ndjson")
@@ -550,6 +560,26 @@ class NetworkTests(unittest.TestCase):
             w2.stop()
         self.assertEqual(calls, ["一", "二", "三"])
         self.assertEqual(ntfy.load_registry()["channels"][cid]["recent_ids"][-1], "m-3")
+
+    def test_catchup_poll_recovers_messages_missed_by_stream(self):
+        """重连时服务器还没把刚发的消息放进缓存：长连接里拿不到，补查能拿到，且已处理的不会重复执行"""
+        cid, ch = make_channel(self.srv.url, self.ws)
+        now = int(time.time())
+        self.srv.poll_events[ch["topic"]] = [
+            {"event": "message", "id": "late-1", "time": now, "message": "迟到的指令"},
+            {"event": "message", "id": "late-1", "time": now, "message": "迟到的指令"},
+        ]
+        calls = []
+        with mock.patch.object(ntfy, "CATCHUP_POLL_DELAYS", (0.3, 0.8)), \
+                mock.patch.object(ntfy, "dispatch_command_to_host",
+                                  side_effect=lambda c, chh, m, attachment_path=None: (calls.append(m) or (True, ""))):
+            w = ntfy.ChannelWorker(cid, ch)
+            w.start()
+            self.assertTrue(wait_for(lambda: calls == ["迟到的指令"], 10))
+            self.assertTrue(wait_for(lambda: self.srv.poll_count >= 2, 10))  # 第二次补查又返回了同一条
+            time.sleep(0.5)
+            w.stop()
+        self.assertEqual(calls, ["迟到的指令"])
 
     def test_worker_reports_failure(self):
         cid, ch = make_channel(self.srv.url, self.ws, host="gui")

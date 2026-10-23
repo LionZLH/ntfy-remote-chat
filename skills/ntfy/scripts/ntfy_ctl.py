@@ -329,6 +329,7 @@ def update_channel(channel_id: str, **fields) -> dict | None:
 
 RECENT_IDS_KEEP = 200
 SINCE_MARGIN_SECONDS = 60
+CATCHUP_POLL_DELAYS = (3, 15)  # 每次连上后，过几秒再主动补查一次漏掉的消息
 
 
 def build_since_query(ch: dict) -> str:
@@ -1429,6 +1430,7 @@ class ChannelWorker(threading.Thread):
             self._remember(old_id)
         self.current: dict | None = None  # {"text": 指令, "started": 开始时间}
         self.cancel_event = threading.Event()
+        self.event_lock = threading.Lock()
         self.executor = threading.Thread(target=self._execute_loop, daemon=True)
 
     def describe_activity(self) -> str:
@@ -1538,6 +1540,35 @@ class ChannelWorker(threading.Thread):
             finally:
                 self.busy = False
 
+    def _handle_event_locked(self, ev: dict) -> None:
+        with self.event_lock:  # 长连接线程与补查线程都会投递消息，串行处理，配合去重保证不重复
+            self._handle_event(ev)
+
+    def _catchup_polls(self, server: str, topic: str, conn_done: threading.Event) -> None:
+        """连上后主动补查：ntfy.sh 刚收到的消息要过一会儿才能被补发查询查到，
+        重连若恰好发生在这段时间内，那几条消息只能等到下次重连。这里过几秒再查一次，已处理的由去重跳过。"""
+        waited = 0.0
+        for delay in CATCHUP_POLL_DELAYS:
+            if conn_done.wait(delay - waited) or self.stop_event.is_set():
+                return
+            waited = delay
+            try:
+                ch = load_registry().get("channels", {}).get(self.channel_id)
+                if not ch:
+                    return
+                since = build_since_query(ch) or "?since=10m"
+                url = f"{server}/{topic}/json{since}&poll=1"
+                headers = {"User-Agent": USER_AGENT}
+                headers.update(_auth_headers(ch.get("auth_token", "")))
+                with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as resp:
+                    for line in iter_stream_lines(resp, self.stop_event):
+                        with contextlib.suppress(Exception):
+                            ev = json.loads(line)
+                            if ev.get("event") == "message":
+                                self._handle_event_locked(ev)
+            except Exception as e:  # noqa: BLE001
+                log(f"[WARN] [{self.channel_id}] 补查漏掉的消息失败: {e!r}")
+
     def _handle_event(self, ev: dict) -> None:
         if self.stop_event.is_set():
             return
@@ -1635,13 +1666,20 @@ class ChannelWorker(threading.Thread):
                 req = urllib.request.Request(stream_url, headers=headers)
                 with urllib.request.urlopen(req, timeout=90) as resp:
                     backoff = 3
-                    for line in iter_stream_lines(resp, self.stop_event):
-                        try:
-                            ev = json.loads(line)
-                        except Exception:
-                            continue
-                        if ev.get("event") == "message":
-                            self._handle_event(ev)
+                    conn_done = threading.Event()
+                    threading.Thread(
+                        target=self._catchup_polls, args=(server, topic, conn_done), daemon=True
+                    ).start()
+                    try:
+                        for line in iter_stream_lines(resp, self.stop_event):
+                            try:
+                                ev = json.loads(line)
+                            except Exception:
+                                continue
+                            if ev.get("event") == "message":
+                                self._handle_event_locked(ev)
+                    finally:
+                        conn_done.set()
             except Exception as e:
                 if self.stop_event.is_set():
                     break
