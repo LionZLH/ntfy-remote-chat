@@ -5,7 +5,7 @@ metadata:
   dbs-handoff: |
     - 用户输入 /ntfy、$ntfy 或要求为当前对话框生成/绑定 ntfy 远程对话 → 识别宿主类型、当前会话 ID 与工作目录，运行 scripts/ntfy_ctl.py bind，交付订阅链接、防休眠状态，并原样转告输出中的 warnings
     - 收到来自手机 ntfy 频道的远程指令（或手机上传的图片/文件） → 读取指令及 .ntfy_inbox/ 下的附件，在绑定工作目录下执行任务，按指令里的说明把结果推回手机
-    - 用户要求查看、暂停、恢复、解绑频道、开关防休眠或卸载 → 运行 scripts/ntfy_ctl.py status / unbind / sleep / uninstall 并汇报实际状态
+    - 用户输入 /ntfy panel、查看所有已配置对话服务、删除某个频道（/ntfy rm 1）、暂停/恢复、清空、开关防休眠或卸载 → 运行 scripts/ntfy_ctl.py panel / rm / pause / resume / clear / sleep / uninstall 并直接展示结果
     - 不交出：跨对话框扫描串台的通配路由、将私密 Topic 泄露给第三方外网接口的默认行为、推送密钥/凭证文件
 ---
 
@@ -50,9 +50,16 @@ EOF
 NTFY notify --channel "<频道ID>" --title "<项目> | 产出文件" --msg "已生成成品图与报告" \
   --file "/abs/path/result.png" --file "/abs/path/report.md"
 
-# 4. 状态 / 解绑 / 防休眠 / 卸载
+# 4. 全局总控面板（带 #1, #2 序号的 Markdown 表格）；status 输出 JSON
+NTFY panel
 NTFY status
-NTFY unbind --channel "<频道ID或会话ID>"
+
+# 5. 按序号 / 名称 / 会话 ID / Topic 管理频道
+NTFY rm 1                 # 删除并解绑（同 unbind / delete），会向手机发"频道已销毁"
+NTFY pause 1 ; NTFY resume 1
+NTFY clear                # 清空全部频道
+
+# 6. 防休眠 / 卸载后台服务
 NTFY sleep --mode <auto|on|off> [--min-battery 20]
 NTFY uninstall [--purge]
 ```
@@ -79,8 +86,12 @@ NTFY uninstall [--purge]
 3. 向用户交付：
    - 订阅信息：Topic、手机深链 `ntfy://<server>/<topic>`、网页链接 `https://<server>/<topic>`，以及二维码路径（如已生成）；
    - 守护进程与防休眠状态，MacBook 合盖会睡眠的提醒；
-   - 手机端用法：直接发文字或图片/文件；`状态` `/status`、`暂停` `/pause`、`恢复` `/resume`、`帮助` `/help`、`/sleep on|off|auto`；
-   - **输出中的全部 `warnings`**（尤其是没有访问控制的安全提示）。
+   - 手机端用法：直接发文字或图片/文件；`状态` `/status`、`暂停` `/pause`、`恢复` `/resume`、`销毁频道` `/delete`、`帮助` `/help`、`/sleep on|off|auto`；
+   - **安全警告（每次绑定必带）**：转述输出中的 `security_warning` 与全部 `warnings`——切勿分享、转发或截图暴露二维码、Topic 与订阅链接；泄露后立即发送 `销毁频道` 或执行 `/ntfy rm <序号>`，再 `bind --rotate`。
+
+### 场景三：用户输入 `/ntfy panel`、`/ntfy rm 1`、`/ntfy pause 1`、`/ntfy clear`
+
+运行对应子命令；`panel` 的输出是 Markdown 表格，直接原样展示给用户。
 
 ### 场景二：收到手机发来的远程指令
 
@@ -92,10 +103,11 @@ NTFY uninstall [--purge]
 
 ---
 
-## 停止与安全边界
+## 安全边界与免责声明
 
 - 不读取、不输出、不通过 ntfy 上传任何密钥文件（`.env`、私钥、凭证等）。
 - 默认不向第三方二维码 API 发送 Topic（`--online-qr` 需用户明确同意）。
 - 手机附件只接受同一 ntfy 服务器托管的附件链接，下载到 `.ntfy_inbox/`（目录内自带 `.gitignore`）。
 - 用户只要求查看状态（如 `/ntfy status`）时，只运行 `status`，不修改注册表。
 - 不要把 Topic 贴到公开位置；怀疑泄露时用 `bind --rotate` 轮换。
+- **免责声明**：本 Skill 用于开发者通过个人手机远程操控自己信任的本地 AI 会话。手机指令会由本地 AI 在绑定的工作目录中直接执行；因分享或泄露订阅链接/二维码、在公共信道传输机密数据或下达破坏性指令造成的损失，由使用者自行承担。

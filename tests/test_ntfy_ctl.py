@@ -334,6 +334,53 @@ class NetworkTests(unittest.TestCase):
         self.assertIn("已拒绝工作目录外的文件", final)
 
 
+class PanelTests(unittest.TestCase):
+    def setUp(self):
+        self.srv = FakeNtfy()
+        with ntfy.registry_txn() as reg:
+            reg["channels"] = {}
+        self.c1, _ = make_channel(self.srv.url, TMP_HOME, title="项目甲", conv_id="conv-a", conv_id_auto=False)
+        self.c2, _ = make_channel(self.srv.url, TMP_HOME, title="项目乙", conv_id="conv-b", conv_id_auto=False)
+
+    def tearDown(self):
+        self.srv.close()
+
+    def test_find_by_index_and_title(self):
+        reg = ntfy.load_registry()
+        self.assertEqual(ntfy.find_channel(reg, "#2")[0], self.c2)
+        self.assertEqual(ntfy.find_channel(reg, "1")[0], self.c1)
+        self.assertEqual(ntfy.find_channel(reg, "项目乙")[0], self.c2)
+        self.assertEqual(ntfy.find_channel(reg, "")[0], None)
+
+    def test_pause_resume_rm_clear(self):
+        self.assertEqual(ntfy.main(["pause", "1"]), 0)
+        self.assertEqual(ntfy.load_registry()["channels"][self.c1]["status"], "paused")
+        self.assertEqual(ntfy.main(["resume", "#1"]), 0)
+        self.assertEqual(ntfy.load_registry()["channels"][self.c1]["status"], "active")
+        self.assertEqual(ntfy.main(["rm", "2"]), 0)
+        self.assertNotIn(self.c2, ntfy.load_registry()["channels"])
+        self.assertTrue(any("频道已销毁" in m["title"] for m in self.srv.json_msgs()))
+        self.assertEqual(ntfy.main(["unbind", "--channel", "conv-a", "--quiet"]), 0)
+        self.assertEqual(ntfy.load_registry()["channels"], {})
+        make_channel(self.srv.url, TMP_HOME)
+        self.assertEqual(ntfy.main(["clear", "--quiet"]), 0)
+        self.assertEqual(ntfy.load_registry()["channels"], {})
+
+    def test_panel_output(self):
+        import contextlib, io
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertEqual(ntfy.main(["panel"]), 0)
+        out = buf.getvalue()
+        self.assertIn("**`#1`**", out)
+        self.assertIn("项目乙", out)
+
+    def test_phone_delete(self):
+        ch = ntfy.load_registry()["channels"][self.c1]
+        self.assertTrue(ntfy.handle_meta_command(self.c1, ch, "销毁频道。"))
+        self.assertNotIn(self.c1, ntfy.load_registry()["channels"])
+
+
 class PromptTests(unittest.TestCase):
     def test_prompt_example_not_parsed_as_file(self):
         ch = {"topic": "t", "workspace": TMP_HOME, "title": "x"}

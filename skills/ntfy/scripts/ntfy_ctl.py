@@ -15,7 +15,8 @@ ntfy_ctl.py
    电池低电量时自动释放；全部解绑后自动释放。
 4. 断线补抓与防重放：持久化 `last_event_id`，重连时 `?since=` 补抓；超过 300 秒的陈旧指令不执行，并回执告知手机。
 5. 每个频道串行执行：同一频道的指令排队逐条执行，带超时；执行失败或宿主不支持时回执告知手机。
-6. 手机端秒级元指令：`/status`、`/help`、`/pause`、`/resume`、`/sleep on|off|auto`。
+6. 手机端秒级元指令：`/status`、`/help`、`/pause`、`/resume`、`/sleep on|off|auto`、`/delete`。
+   电脑端总控面板：`panel`、`rm <序号>`、`pause/resume <序号>`、`clear`。
 7. 跨 IDE 投递适配器：Antigravity (`agentapi`)、Claude Code (`claude -p`)、Codex (`codex exec`)。
 """
 
@@ -812,12 +813,25 @@ def generate_qr_code(url: str, out_path: Path, allow_online: bool = False) -> tu
 
 
 def find_channel(reg: dict, selector: str) -> tuple[str | None, dict | None]:
-    """根据 channel_id / conv_id / alias / topic 查找频道配置"""
+    """支持按序号 (1, #1)、channel_id、conv_id、alias、title 或 topic 查找频道配置"""
     channels = reg.get("channels", {})
-    if selector in channels:
-        return selector, channels[selector]
+    sel = (selector or "").strip()
+    if not sel:
+        return None, None
+    if sel in channels:
+        return sel, channels[sel]
     for cid, ch in channels.items():
-        if selector in (ch.get("conv_id"), ch.get("alias"), ch.get("topic")):
+        if sel in (ch.get("conv_id"), ch.get("topic")):
+            return cid, ch
+    # 总控面板序号（如 "1"、"#1"）
+    idx_str = sel.lstrip("#")
+    if idx_str.isdigit():
+        idx = int(idx_str) - 1
+        items = list(channels.items())
+        if 0 <= idx < len(items):
+            return items[idx]
+    for cid, ch in channels.items():
+        if sel in (ch.get("alias"), ch.get("title")):
             return cid, ch
     return None, None
 
@@ -1033,17 +1047,21 @@ def dispatch_command_to_host(
 
 def handle_meta_command(channel_id: str, ch: dict, message: str) -> bool:
     """处理手机端秒级系统元指令（不唤醒 AI）"""
-    norm = re.sub(r"\s+", " ", message.strip().lower())
+    norm = re.sub(r"\s+", " ", message.strip().lower()).strip("。！!.,，")
     title_prefix = ch.get("title") or ch.get("alias") or "远程对话"
 
-    if norm in ("/status", "status", "状态"):
+    def _log_meta() -> None:
+        log(f"[META_CMD] [{channel_id}] 响应手机元指令: {norm}")
+
+    if norm in ("/status", "status", "状态", "查看状态"):
+        _log_meta()
         pwr = detect_power_and_sleep_status()
         reg = load_registry()
         caff_str = f"运行中 (PID {', '.join(pwr['sleep_guard_pids'])})" if pwr["sleep_guard_pids"] else "未开启"
         msg = (
             f"**频道状态**\n"
             f"- 绑定名称：{title_prefix}\n"
-            f"- 运行状态：{ch.get('status', 'active')}\n"
+            f"- 运行状态：{'正常运行 (active)' if ch.get('status', 'active') == 'active' else '已暂停 (paused)'}\n"
             f"- 宿主引擎：{ch.get('host', 'antigravity')}\n"
             f"- 绑定会话：`{ch.get('conv_id', '')}`\n"
             f"- 工作目录：`{ch.get('workspace', '')}`\n\n"
@@ -1055,40 +1073,56 @@ def handle_meta_command(channel_id: str, ch: dict, message: str) -> bool:
         _ch_send(ch, f"{title_prefix} | 系统状态", msg)
         return True
 
-    if norm in ("/help", "help", "帮助"):
+    if norm in ("/help", "help", "帮助", "指令"):
+        _log_meta()
         msg = (
             f"**直接发送文字或图片/文件**\n"
             f"- 直接打字发送指令，或点回形针上传图片/文档，投递至绑定对话（`{ch.get('conv_id', '')[:8]}...`）。\n"
             f"- 同一频道的指令按顺序逐条执行。\n\n"
-            f"**内置秒级元指令**\n"
+            f"**内置秒级元指令（不唤醒 AI，不耗 Token）**\n"
             f"- `状态` / `/status`：电脑电量、防休眠与绑定状态\n"
             f"- `暂停` / `/pause`、`恢复` / `/resume`：暂停/恢复本频道\n"
-            f"- `/sleep on|off|auto`：强制开启 / 关闭 / 自动防休眠"
+            f"- `/sleep on|off|auto`：强制开启 / 关闭 / 自动防休眠\n"
+            f"- `销毁频道` / `/delete`：从电脑总控台解绑并停用本频道"
         )
         _ch_send(ch, f"{title_prefix} | 指令帮助", msg)
         return True
 
-    if norm in ("/pause", "pause", "暂停"):
+    if norm in ("/pause", "pause", "暂停", "暂停监听"):
+        _log_meta()
         update_channel(channel_id, status="paused")
         _ch_send(ch, f"{title_prefix} | 已暂停", "本频道已暂停转发业务指令。发送 `恢复` 或 `/resume` 可重新激活。")
         return True
 
-    if norm in ("/resume", "resume", "恢复"):
+    if norm in ("/resume", "resume", "恢复", "恢复监听"):
+        _log_meta()
         update_channel(channel_id, status="active")
         _ch_send(ch, f"{title_prefix} | 已恢复", "本频道已恢复正常监听，现在可以直接发送指令。")
         return True
 
     sleep_map = {
-        "/sleep on": "on", "开启防休眠": "on",
-        "/sleep off": "off", "关闭防休眠": "off",
-        "/sleep auto": "auto", "自动防休眠": "auto",
+        "/sleep on": "on", "sleep on": "on", "开启防休眠": "on", "防休眠开启": "on",
+        "/sleep off": "off", "sleep off": "off", "关闭防休眠": "off", "防休眠关闭": "off",
+        "/sleep auto": "auto", "sleep auto": "auto", "自动防休眠": "auto",
     }
     if norm in sleep_map:
+        _log_meta()
         mode = sleep_map[norm]
         with registry_txn() as reg:
             reg["sleep_guard"] = mode
         desc = {"on": "强制开启", "off": "已关闭（电脑可正常休眠）", "auto": "自动（有活跃频道且电量充足时开启）"}[mode]
         _ch_send(ch, f"{title_prefix} | 防休眠：{mode}", f"全局防休眠模式已设为 {desc}。")
+        return True
+
+    if norm in ("/delete", "/rm", "销毁频道", "删除频道"):
+        _log_meta()
+        with registry_txn() as reg:
+            reg.get("channels", {}).pop(channel_id, None)
+        _ch_send(
+            ch,
+            f"{title_prefix} | 频道已销毁",
+            "本频道已从电脑总控台解绑移除，后台不再监听。现在可以在手机 ntfy App 中长按删除此订阅。",
+        )
         return True
 
     return False
@@ -1702,7 +1736,9 @@ def cmd_bind(args: argparse.Namespace) -> int:
             f"**使用方法**\n"
             f"- 直接打字或点回形针发图片/文件即可唤醒电脑执行（按顺序逐条执行）；\n"
             f"- 电脑产出的图片、PDF、视频等会直接发回本频道；\n"
-            f"- 发送 `状态` 查看电脑状态，`帮助` 查看全部指令。"
+            f"- 发送 `状态` 查看电脑状态，`帮助` 查看全部指令，`销毁频道` 立即解绑。\n\n"
+            f"**安全警示**\n"
+            f"请勿向任何人分享、转发或截图暴露本频道的二维码、Topic 与订阅链接（持有即可读取消息并远程控制当前对话）。"
         )
         test_sent = send_ntfy_message(server, topic, f"{title} | 远程对话已就绪", welcome_msg,
                                       auth_token=entry["auth_token"], keep_emoji=entry["keep_emoji"])
@@ -1711,6 +1747,11 @@ def cmd_bind(args: argparse.Namespace) -> int:
         "ok": True,
         "channel": _public_channel(entry),
         "warnings": warnings,
+        "security_warning": (
+            "严禁分享二维码、Topic 或订阅链接！它等同于当前 AI 对话框的免密远程控制密钥，"
+            "泄露后他人可查看通知并向电脑发送指令。若不慎暴露，请在手机发送「销毁频道」或运行 rm 作废，"
+            "并用 bind --rotate 换新 Topic。"
+        ),
         "qr_generated": qr_ok,
         "qr_mode": qr_mode,
         "test_notification_sent": test_sent,
@@ -1791,29 +1832,140 @@ def cmd_status(_args: argparse.Namespace) -> int:
         "min_battery": reg.get("min_battery", DEFAULT_MIN_BATTERY),
         "daemon_running": is_daemon_running(),
         "power_and_sleep": detect_power_and_sleep_status(),
-        "hub_channels": [_public_channel(c) for c in reg.get("channels", {}).values()],
+        "hub_channels": [
+            {"index": i, **_public_channel(c)} for i, c in enumerate(reg.get("channels", {}).values(), start=1)
+        ],
         "other_ntfy_services": detect_other_ntfy_agents(),
         "log_path": str(LOG_PATH),
     }, ensure_ascii=False, indent=2))
     return 0
 
 
+def cmd_panel(_args: argparse.Namespace) -> int:
+    """输出 Markdown 表格版全局总控面板（带 #1, #2 序号）"""
+    reg = load_registry()
+    power = detect_power_and_sleep_status()
+    channels = list(reg.get("channels", {}).values())
+    pids = power.get("sleep_guard_pids") or []
+    caff_str = f"运行中 (PID: {', '.join(pids)})" if pids else "未开启"
+    daemon_str = f"运行中 (PID {power['daemon_pid']})" if power.get("daemon_pid") else ("运行中" if is_daemon_running() else "未运行")
+    lines = [
+        "### ntfy 全局远程对话总控面板",
+        "",
+        f"- **电脑电源**：{power.get('power_source', 'Unknown')} ({power.get('battery_percent', 'Unknown')})",
+        f"- **防休眠锁**：{caff_str}（策略：`{reg.get('sleep_guard', 'auto')}`，电池低于 {reg.get('min_battery', DEFAULT_MIN_BATTERY)}% 自动释放）",
+        f"- **守护进程**：{daemon_str} | 已绑定频道数：**{len(channels)}**",
+        "",
+    ]
+    if not channels:
+        lines.append("> 当前暂无绑定的远程对话频道。在任意对话框输入 `/ntfy` 即可一键生成并绑定。")
+    else:
+        lines += [
+            "| 序号 | 频道名称 | 状态 | 宿主 | 专属 Topic | 绑定会话 ID | 工作目录 | 最近指令 |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
+        ]
+        for idx, ch in enumerate(channels, start=1):
+            status_str = "运行中" if ch.get("status", "active") == "active" else "已暂停"
+            title = ch.get("title") or ch.get("alias") or ch.get("channel_id")
+            conv_id = ch.get("conv_id") or "-"
+            if ch.get("conv_id_auto"):
+                conv_id += "（自动）"
+            last_cmd = (ch.get("last_cmd_text") or "-").replace("|", "\\|").replace("\n", " ")
+            if len(last_cmd) > 24:
+                last_cmd = last_cmd[:24] + "..."
+            lines.append(
+                f"| **`#{idx}`** | **{title}** | `{status_str}` | {ch.get('host', '-')} | `{ch.get('topic', '')}` "
+                f"| `{conv_id}` | `{ch.get('workspace') or '-'}` | {last_cmd} |"
+            )
+        lines += [
+            "",
+            "**快捷管理指令：**",
+            "- 删除指定频道：`/ntfy rm 1`（或 `ntfy_ctl.py rm 1`）",
+            "- 暂停/恢复频道：`/ntfy pause 1` / `/ntfy resume 1`（或在手机端直接发 `暂停` / `恢复`）",
+            "- 手机端自毁当前频道：在手机 ntfy 频道内发送 `销毁频道` 或 `/delete`",
+            "- 清空全部频道：`/ntfy clear`；彻底移除后台服务：`ntfy_ctl.py uninstall`",
+            "",
+            "> **安全警示**：上表中的「专属 Topic」及对应二维码/订阅链接等同于对应 AI 对话框的**免密远程控制密钥**，"
+            "切勿分享或在截图中暴露。若不慎泄露，请立即执行 `/ntfy rm <序号>` 或在手机发送 `销毁频道` 作废。",
+        ]
+    print("\n".join(lines))
+    return 0
+
+
+def _notify_destroyed(ch: dict, cid: str) -> None:
+    with contextlib.suppress(Exception):
+        send_ntfy_message(
+            server=ch.get("server", DEFAULT_SERVER),
+            topic=ch["topic"],
+            title=f"{ch.get('title', '远程对话')} | 频道已销毁",
+            message=(
+                f"该对话的远程监听已从总控中心移除，后续消息不再触发电脑端任务。\n"
+                f"- **移除频道**：`{ch.get('title', cid)}`\n"
+                f"- **原会话 ID**：`{ch.get('conv_id') or '未指定'}`"
+            ),
+            priority=3,
+            auth_token=ch.get("auth_token", ""),
+            keep_emoji=bool(ch.get("keep_emoji")),
+        )
+
+
+def _remove_qr(ch: dict) -> None:
+    with contextlib.suppress(Exception):
+        if ch.get("qr_path"):
+            Path(ch["qr_path"]).unlink()
+
+
 def cmd_unbind(args: argparse.Namespace) -> int:
+    quiet = bool(getattr(args, "quiet", False))
+    if getattr(args, "all", False):
+        with registry_txn() as reg:
+            removed_all = list(reg.get("channels", {}).items())
+            reg["channels"] = {}
+        for cid, ch in removed_all:
+            _remove_qr(ch)
+            if not quiet:
+                _notify_destroyed(ch, cid)
+        print(json.dumps({
+            "ok": True,
+            "cleared_count": len(removed_all),
+            "note": "已无活跃频道，防休眠锁会在数秒内自动释放；如需彻底移除后台服务，运行 uninstall。",
+        }, ensure_ascii=False, indent=2))
+        return 0
+
+    query = getattr(args, "target", "") or getattr(args, "channel", "")
+    if not query:
+        print("ERROR: 请提供要删除的频道序号（如 1）、名称、会话 ID 或 Topic，或使用 --all 清空全部。", file=sys.stderr)
+        return 1
     with registry_txn() as reg:
-        cid, ch = find_channel(reg, args.channel)
+        cid, ch = find_channel(reg, query)
         if not cid or not ch:
-            print(f"ERROR: 未找到频道: {args.channel}", file=sys.stderr)
+            print(f"ERROR: 未找到频道: {query}", file=sys.stderr)
             return 1
         removed = reg["channels"].pop(cid)
         remaining = len(reg["channels"])
-    with contextlib.suppress(Exception):
-        qp = removed.get("qr_path")
-        if qp:
-            Path(qp).unlink()
+    _remove_qr(removed)
+    if not quiet:
+        _notify_destroyed(removed, cid)
     out = {"ok": True, "unbound": _public_channel(removed), "remaining_channels": remaining}
     if remaining == 0:
         out["note"] = "已无活跃频道，防休眠锁会在数秒内自动释放；如需彻底移除后台服务，运行 uninstall。"
     print(json.dumps(out, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_pause_resume(args: argparse.Namespace, enable: bool) -> int:
+    query = getattr(args, "target", "") or getattr(args, "channel", "")
+    new_status = "active" if enable else "paused"
+    with registry_txn() as reg:
+        cid, ch = find_channel(reg, query)
+        if not cid or not ch:
+            print(f"ERROR: 未找到频道: {query}", file=sys.stderr)
+            return 1
+        ch["status"] = new_status
+    print(json.dumps({
+        "ok": True, "channel_id": cid, "title": ch.get("title"), "status": new_status,
+        "label": "已恢复运行" if enable else "已暂停监听",
+    }, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -1877,7 +2029,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_bind.add_argument("--dry-run", action="store_true", help="仅预览配置，不写入也不启动守护进程")
 
     p_notify = sub.add_parser("notify", help="向绑定的手机 ntfy 频道发送文字、图片或文件")
-    p_notify.add_argument("--channel", type=str, required=True, help="频道 ID、会话 ID、别名或 Topic")
+    p_notify.add_argument("--channel", type=str, required=True, help="频道序号(#1)、频道 ID、会话 ID、别名或 Topic")
     p_notify.add_argument("--title", type=str, default="", help="通知标题")
     p_notify.add_argument("--msg", type=str, default="", help="通知正文 (Markdown)；字面 \\n 会被转成换行")
     p_notify.add_argument("--msg-file", type=str, default="", help="从文件读取正文，传 - 表示从标准输入读取")
@@ -1890,11 +2042,24 @@ def build_parser() -> argparse.ArgumentParser:
     p_notify.add_argument("--token", type=str, default="", help="配合 --raw-topic 使用的访问令牌")
     p_notify.add_argument("--force", action="store_true", help="允许推送疑似密钥/凭证文件")
 
-    sub.add_parser("status", help="查看防休眠、电源与所有已绑定频道状态")
-    sub.add_parser("list", help="列出所有已绑定频道状态")
+    sub.add_parser("status", help="输出 JSON 格式的防休眠、电源与所有频道状态")
+    sub.add_parser("list", help="输出 JSON 格式的所有已绑定频道状态")
+    sub.add_parser("panel", help="输出 Markdown 表格版全局总控面板（含 #1, #2 序号与管理指令）")
 
-    p_unbind = sub.add_parser("unbind", help="解绑并停止指定对话框的 ntfy 监听")
-    p_unbind.add_argument("--channel", type=str, required=True, help="频道 ID、会话 ID、别名或 Topic")
+    for cmd_name in ("unbind", "rm", "delete"):
+        p_rm = sub.add_parser(cmd_name, help="解绑并删除指定频道（支持序号如 1、名称、conv_id 或 Topic）")
+        p_rm.add_argument("target", nargs="?", default="", help="频道序号(如 1 或 #1)、名称、会话 ID 或 Topic")
+        p_rm.add_argument("--channel", type=str, default="", help="频道标识（兼容旧参数）")
+        p_rm.add_argument("--all", action="store_true", help="清空所有已绑定的频道")
+        p_rm.add_argument("--quiet", action="store_true", help="静默解绑，不向手机发送销毁通知")
+
+    p_clear = sub.add_parser("clear", help="一键清空所有已绑定的频道")
+    p_clear.add_argument("--quiet", action="store_true", help="静默清空")
+
+    for cmd_name, verb in (("pause", "暂停"), ("resume", "恢复")):
+        p_pr = sub.add_parser(cmd_name, help=f"{verb}指定频道的指令监听（支持序号 1、名称或 Topic）")
+        p_pr.add_argument("target", nargs="?", default="", help="频道序号(1)、名称、会话 ID 或 Topic")
+        p_pr.add_argument("--channel", type=str, default="", help="频道标识")
 
     p_sleep = sub.add_parser("sleep", help="控制电脑防休眠模式 (auto/on/off)")
     p_sleep.add_argument("--mode", type=str, default="status", choices=["auto", "on", "off", "status"])
@@ -1915,8 +2080,17 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_notify(args)
     if args.subcommand in ("status", "list"):
         return cmd_status(args)
-    if args.subcommand == "unbind":
+    if args.subcommand == "panel":
+        return cmd_panel(args)
+    if args.subcommand in ("unbind", "rm", "delete"):
         return cmd_unbind(args)
+    if args.subcommand == "clear":
+        args.all = True
+        return cmd_unbind(args)
+    if args.subcommand == "pause":
+        return cmd_pause_resume(args, enable=False)
+    if args.subcommand == "resume":
+        return cmd_pause_resume(args, enable=True)
     if args.subcommand == "sleep":
         return cmd_sleep(args)
     if args.subcommand == "uninstall":
