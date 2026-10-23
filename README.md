@@ -1,6 +1,6 @@
 # ntfy-remote-chat
 
-将任意 AI IDE 对话框（Antigravity、Codex、Claude Code、WorkBuddy、Cursor 等）一键生成专属的手机 `ntfy` 双向远程控制频道。自动完成 **160-bit 防扫库专属订阅连接**、**1 对 1 会话锁死防串台**、**跨平台防休眠联动**、**常驻自愈监听与断线补抓**，并支持**电脑与手机双向直传图片、文档与视频预览**。
+把 AI IDE 对话框（Claude Code、Codex、Antigravity）一键变成手机 `ntfy` 双向远程控制频道：手机发文字或图片 → 电脑上的 AI 执行 → 结果（文字、图片、文档、视频）推回手机。
 
 ---
 
@@ -10,48 +10,88 @@
 npx -y skills add LionZLH/ntfy-remote-chat -g --all
 ```
 
+安装后在对话框里输入 `/ntfy`（或 `$ntfy`），或者直接说：
+
+> 给这个对话框生成一个 ntfy 手机远程控制频道
+
 ---
 
 ## 核心特性
 
-1. **严格 1 对 1 物理隔离（防串台）**：
-   每个对话框生成独立的 28 位密码学高熵随机 Topic（熵值 $>160\text{ bits}$，在公共服务器上无法被枚举或暴力扫描），并与唯一会话 ID 和工作目录刚性锁死，多开项目互不串台。
-2. **双向收发「图片、文件与视频预览」**：
-   - **电脑 $\rightarrow$ 手机**：AI 产出的图片（`.png` / `.jpg` / `.webp`）直接在手机 `ntfy` App 渲染为高清大图预览；产出的文档（`.pdf` / `.md` / `.pptx` / `.zip`）显示为一键下载卡片；超出 14MB 的大视频（`.mp4` / `.mov`）自动调用 `ffmpeg` 压制轻量手机预览版直推手机。
-   - **手机 $\rightarrow$ 电脑**：在手机 `ntfy` App 点击输入框旁回形针上传图片或文件，守护进程自动下载至工作目录 `.ntfy_inbox/` 并唤醒 AI 读取处理。
-3. **跨平台防休眠生命周期联动**：
-   - **macOS**：自动托管 `caffeinate -dims` + `launchd` (`LaunchAgents`) 常驻自愈；
-   - **Linux**：自动调用 `systemd-inhibit`；
-   - **Windows**：自动调用 `SetThreadExecutionState`；
-   - 只要存在至少 1 个活跃监听频道自动维持防休眠，全部解绑后自动释放。
-4. **断线补抓与防重放**：
-   持久化记录每个频道的 `last_event_id`，网络重连时携带 `?since=` 补抓闪断期间的指令，并自动丢弃超过 300 秒的陈旧历史消息。
-5. **手机端 0.2 秒响应的内置元指令**：
-   - 发送 `状态` 或 `/status`：秒回电脑电量、防休眠进程 PID、绑定目录与会话状态（不消耗 AI Token）；
-   - 发送 `暂停` / `恢复`（`/pause` / `/resume`）：随时暂停或恢复该频道指令监听；
-   - 发送 `/sleep on` / `/sleep off`：手机远程开关电脑防休眠锁。
+1. **1 对 1 隔离**：每个对话框生成独立的 28 位随机 Topic（约 166 bits，不含用户名和项目名），与会话 ID、工作目录绑定。
+2. **双向收发图片、文件与视频**
+   - **电脑 → 手机**：图片在 App 内直接大图预览；`.md` / `.txt` / `.json` 等文本内联展示；PDF、Office、压缩包显示为可点击的下载卡片；超过 14MB 的视频自动用 `ffmpeg` 压成 480p 预览版。
+   - **手机 → 电脑**：点输入框旁的回形针上传，守护进程下载到工作目录的 `.ntfy_inbox/`（自带 `.gitignore`，不会被提交），再唤醒 AI 处理。
+3. **跨平台防休眠**：macOS `caffeinate -ims`、Linux `systemd-inhibit`、Windows `SetThreadExecutionState`。有活跃频道才开启，不强制亮屏；电池低于 20% 时自动释放（可调）。
+4. **常驻与自愈**：macOS 用 `launchd`，Linux 用 `systemd --user`，Windows 用登录自启。同一时间只运行一个守护进程，Skill 更新后自动重启加载新代码。
+5. **不静默丢指令**
+   - 断线重连后用 `?since=` 补抓漏掉的消息；
+   - 超过 300 秒的旧指令（比如电脑休眠期间发的）不执行，但会回执告诉手机；
+   - 宿主不支持或执行失败，也会回执说明原因；
+   - 同一频道的指令排队逐条执行，单条默认最长 30 分钟。
+6. **手机端元指令（不消耗 AI Token）**：`状态` `/status`、`暂停` `/pause`、`恢复` `/resume`、`帮助` `/help`、`/sleep on|off|auto`。
+
+## 宿主支持
+
+| 宿主 | 手机唤醒方式 | 结果回传 |
+|---|---|---|
+| Claude Code | `claude --resume <会话ID> -p` | 最终回复自动推回手机 |
+| Codex | `codex exec resume <会话ID>`（失败则开新会话） | 最终回复自动推回手机 |
+| Antigravity | `agentapi send-message` 投递到原对话 | AI 调用 `notify` 推回 |
+| Cursor、WorkBuddy 等 | 暂不支持 | 可用 `notify` 单向推送 |
+
+> Claude Code 用 `--resume` 打开的是一个新的后台进程。IDE 里正在显示的那个窗口不会实时刷新，结果以手机推送为准。
 
 ---
 
-## 使用方式
+## 安全须知（请务必阅读）
 
-安装后，在任何 AI IDE 对话框中直接输入：
+- **Topic 就是密码。** 在公共 `ntfy.sh` 上，任何知道 Topic 的人都能读取频道里的历史消息，也能向你的电脑发指令。不要截图或公开 Topic；怀疑泄露时运行 `bind --rotate` 换一个新的。
+- **强烈建议开启访问控制。** 用自建 ntfy 服务器，或 ntfy Pro 的受保护 Topic，然后通过 `bind --server <地址> --token tk_xxx` 绑定。没有配置 token 时，绑定结果里会给出安全提示。
+- **默认最小权限。**
+  - Claude Code 默认 `acceptEdits`：可以改文件，不能执行命令。需要更多能力时用 `--permission-mode auto` 或 `bypassPermissions`。
+  - Codex 默认 `workspace-write` 沙箱。
+  - 放宽权限前，请先做好上面的访问控制。
+- **附件。** 只接受同一 ntfy 服务器托管的附件，外部链接一律拒绝，避免 token 泄露或被诱导下载任意内容。`.env`、私钥、凭证类文件默认禁止推送。
+- **本地数据。** 注册表保存在 `~/.agents/state/ntfy-remote-chat/`，目录权限为 700、文件为 600。二维码默认离线生成，不会把 Topic 发给第三方。
 
-> 给这个对话框生成一个 ntfy 手机远程控制频道
+## ntfy.sh 免费版限制
 
-或显式调用：
-
-> 使用 $ntfy-remote-chat 为当前对话框生成专属的 ntfy 手机双向远程控制频道，并开启防休眠与后台常驻监听。
+- 单个附件最大 15MB；附件链接约 **3 小时后失效**，请及时保存。
+- 单条消息正文最大 4096 字节（中文约 1300 字）。超出部分脚本会自动截断，长文请以文件形式发送。
+- 匿名用户有每日消息数量和附件总量的配额。频繁使用建议自建服务器。
 
 ---
+
+## 命令参考
+
+```bash
+NTFY=~/.agents/skills/ntfy/scripts/ntfy_ctl.py
+
+python3 $NTFY bind --host claude --workspace "$PWD" --title "我的项目"   # 绑定
+python3 $NTFY notify --channel <频道ID> --msg-file - <<'EOF'              # 多行文字
+**结果**
+已完成
+EOF
+python3 $NTFY notify --channel <频道ID> --msg "看图" --file ./out.png    # 发文件
+python3 $NTFY status                                                     # 状态
+python3 $NTFY unbind --channel <频道ID>                                  # 解绑
+python3 $NTFY sleep --mode auto --min-battery 20                         # 防休眠策略
+python3 $NTFY uninstall [--purge]                                        # 停止并移除后台服务
+```
+
+- Linux：`systemd --user` 服务默认在注销登录后停止。如需一直运行，请执行 `loginctl enable-linger $USER`。
+- macOS：防休眠无法阻止物理合盖睡眠（除非插电并外接显示器）。
 
 ## 运行依赖
 
-- 支持 Agent Skills 的客户端（Antigravity、Codex、Claude Code、WorkBuddy、Cursor、Gemini CLI 等）
-- Python 3.8+（仅使用标准库，零第三方强依赖）
-- 可选：`ffmpeg`（用于超大视频自动生成手机预览版）、`qrencode`（用于纯离线生成订阅二维码）
+- Python 3.8+（仅标准库）
+- 可选：`ffmpeg`（超大视频压制预览版）、`qrencode` 或 Python `qrcode`（离线生成订阅二维码）
 
-## 隐私与安全说明
+## 开发与测试
 
-- 本仓库只发布运行该 Skill 所需的通用代码，不包含任何个人配置、运行日志或测试记录。
-- 频道 Topic 默认仅在本地与 `ntfy` 服务器之间通信，默认不向任何第三方外部二维码 API 发送私密 Topic。
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+测试使用本地假 ntfy 服务器，不访问外网。
