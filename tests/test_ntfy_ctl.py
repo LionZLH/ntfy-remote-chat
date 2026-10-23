@@ -138,7 +138,9 @@ def make_fake_cli(name: str, body: str) -> Path:
     bindir = Path(tempfile.mkdtemp(prefix="fakebin_"))
     log_path = bindir / "calls.jsonl"
     code = (
-        "import json,os,sys\n"
+        "import json,os,sys,functools\n"
+        "sys.stdout.reconfigure(encoding='utf-8')\n"  # 模拟真实 CLI：按 UTF-8 输出（Windows 默认 cp1252）
+        "open=functools.partial(open,encoding='utf-8')\n"
         "stdin=sys.stdin.buffer.read().decode('utf-8')\n"
         f"open({str(log_path)!r},'a',encoding='utf-8').write(json.dumps({{'argv':sys.argv[1:],'stdin':stdin,"
         "'claudecode':os.environ.get('CLAUDECODE')}, ensure_ascii=False)+'\\n')\n" + body

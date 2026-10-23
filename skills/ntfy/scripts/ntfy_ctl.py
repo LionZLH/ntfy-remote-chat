@@ -106,7 +106,15 @@ EMOJI_PATTERN = re.compile(
 
 
 def log(msg: str) -> None:
-    print(f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}", flush=True)
+    """写日志；输出编码不支持中文时降级为转义字符，日志永远不能让任务失败"""
+    line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+    try:
+        print(line, flush=True)
+    except UnicodeEncodeError:
+        with contextlib.suppress(Exception):
+            print(line.encode("ascii", "backslashreplace").decode("ascii"), flush=True)
+    except Exception:
+        pass
 
 
 def strip_emojis(text: str) -> str:
