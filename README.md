@@ -123,7 +123,7 @@ AI 生成可能要几分钟，为了不让你干等：
 ### 3. 命令行参考（`ntfy_ctl.py`）
 
 ```bash
-NTFY=~/.agents/skills/ntfy/scripts/ntfy_ctl.py   # Windows 用 python 代替 python3
+NTFY=~/.agents/skills/ntfy/scripts/ntfy_ctl.py   # Windows 用 py -3 代替 python3
 
 # 总控面板（Markdown 表格）；status 输出 JSON
 python3 $NTFY panel
@@ -211,6 +211,8 @@ python3 $NTFY uninstall [--purge]
 ## 运行依赖
 
 - Python 3.8+（仅使用标准库）
+  - **Windows：后台服务需要 Python 3.10 及以上。** 用 `py -3` 运行脚本即可；如果用旧版本运行 `bind`，脚本会通过 Windows 自带的 `py` 启动器自动找到本机安装的新版 Python 来运行后台服务，找不到时会提示安装。
+  - macOS 自带的 `python3`（3.9）可以直接使用。
 - 可选：`ffmpeg`（压制超大视频的预览版）、`qrencode` 或 Python `qrcode`（离线生成订阅二维码）
 
 ## 开发与测试

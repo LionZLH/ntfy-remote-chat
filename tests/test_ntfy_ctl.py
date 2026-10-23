@@ -238,6 +238,23 @@ class TextHelpers(unittest.TestCase):
         self.assertTrue(any("my.host" in g for g in guide["iphone"]))
         self.assertTrue(all("ntfy://" not in g for g in guide["android"]))
 
+    def test_windows_daemon_python_selection(self):
+        # 当前已是 3.10+：直接用当前解释器
+        self.assertEqual(ntfy.find_windows_daemon_python((3, 12)), sys.executable)
+        # 当前 3.9：经 py 启动器找到 3.13
+        fake = mock.Mock(stdout=f"3.13\n{sys.executable}\n")
+        with mock.patch.object(ntfy.shutil, "which", return_value="py"), \
+                mock.patch.object(ntfy.subprocess, "run", return_value=fake):
+            self.assertEqual(ntfy.find_windows_daemon_python((3, 9)), sys.executable)
+        # py 启动器只找到 3.9：返回 None（bind 会给出安装提示）
+        old = mock.Mock(stdout=f"3.9\n{sys.executable}\n")
+        with mock.patch.object(ntfy.shutil, "which", return_value="py"), \
+                mock.patch.object(ntfy.subprocess, "run", return_value=old):
+            self.assertIsNone(ntfy.find_windows_daemon_python((3, 9)))
+        # 没有 py 启动器
+        with mock.patch.object(ntfy.shutil, "which", return_value=None):
+            self.assertIsNone(ntfy.find_windows_daemon_python((3, 9)))
+
     def test_pid_alive(self):
         self.assertTrue(ntfy.is_pid_alive(os.getpid()))
         self.assertFalse(ntfy.is_pid_alive(2 ** 22 + 12345))

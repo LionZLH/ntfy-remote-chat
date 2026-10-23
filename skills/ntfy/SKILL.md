@@ -27,7 +27,7 @@ metadata:
 
 ## 核心脚本
 
-脚本位于本 Skill 目录下的 [scripts/ntfy_ctl.py](scripts/ntfy_ctl.py)（仅依赖 Python 3.8+ 标准库）。下文用 `NTFY` 代指 `python3 <本 Skill 目录>/scripts/ntfy_ctl.py`（Windows 上用 `python`/`py`）。
+脚本位于本 Skill 目录下的 [scripts/ntfy_ctl.py](scripts/ntfy_ctl.py)（仅依赖 Python 3.8+ 标准库）。下文用 `NTFY` 代指 `python3 <本 Skill 目录>/scripts/ntfy_ctl.py`（Windows 上用 `py -3`；Windows 后台服务需要 Python 3.10+，脚本会自动通过 py 启动器选用新版本，找不到时 `warnings` 会提示安装，需转告用户）。
 
 ```bash
 # 1. 绑定当前对话框（显式传 --host；会话 ID 能拿到就传，拿不到可省略，脚本会读取宿主环境变量）

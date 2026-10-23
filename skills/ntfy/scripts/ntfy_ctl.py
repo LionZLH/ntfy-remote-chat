@@ -1788,12 +1788,38 @@ def run_daemon_loop() -> int:
         time.sleep(3)
 
 
+WIN_MIN_DAEMON_PY = (3, 10)  # Python 3.9 在 Windows 上读取长连接消息流会卡住，后台服务至少用 3.10
+
+
+def find_windows_daemon_python(current: tuple | None = None) -> str | None:
+    """Windows 后台服务用的 Python：当前版本够新就用当前的；否则通过 Windows 自带的 py 启动器
+    找本机安装的最新 Python 3（需 3.10+）。找不到返回 None。"""
+    current = tuple(current or sys.version_info[:2])
+    if current >= WIN_MIN_DAEMON_PY:
+        return sys.executable
+    launcher = shutil.which("py")
+    if not launcher:
+        return None
+    try:
+        out = subprocess.run(
+            [launcher, "-3", "-c", "import sys; print('%d.%d' % sys.version_info[:2]); print(sys.executable)"],
+            capture_output=True, text=True, timeout=20,
+        ).stdout.strip().splitlines()
+        version = tuple(int(x) for x in out[0].strip().split("."))
+        exe = out[1].strip()
+        if version >= WIN_MIN_DAEMON_PY and Path(exe).is_file():
+            return exe
+    except Exception:
+        pass
+    return None
+
+
 def _daemon_python() -> str:
-    """Windows 优先用 pythonw.exe，避免弹出控制台窗口"""
+    """后台服务使用的 Python。Windows：优先 3.10+（必要时经 py 启动器自动选用），并用 pythonw.exe 避免弹出控制台窗口"""
     if IS_WIN:
-        pyw = Path(sys.executable).with_name("pythonw.exe")
-        if pyw.is_file():
-            return str(pyw)
+        base = find_windows_daemon_python() or sys.executable
+        pyw = Path(base).with_name("pythonw.exe")
+        return str(pyw) if pyw.is_file() else base
     return sys.executable
 
 
@@ -1822,7 +1848,7 @@ def ensure_background_daemon() -> dict:
     ensure_state_dir()
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     script_abs = os.path.abspath(__file__)
-    info: dict = {"log_path": str(LOG_PATH)}
+    info: dict = {"log_path": str(LOG_PATH), "python": _daemon_python()}
 
     if IS_MAC:
         LAUNCH_AGENTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1996,6 +2022,12 @@ def cmd_bind(args: argparse.Namespace) -> int:
         warnings.append(
             "未能获取当前会话 ID：本频道会使用一个专属的新会话来执行手机指令（与当前对话框的上下文分开，"
             "但绝不会落进其他对话）。如希望手机指令接着当前对话执行，请用 --conv-id 传入会话 ID 重新绑定。"
+        )
+    if IS_WIN and not find_windows_daemon_python():
+        warnings.append(
+            f"Windows 上后台服务需要 Python 3.10 及以上（当前 {sys.version_info[0]}.{sys.version_info[1]}，"
+            "且没有通过 py 启动器找到更新的版本）。3.9 及更早版本可能导致手机指令延迟甚至收不到，"
+            "请从 python.org 安装 Python 3.10+ 后重新运行 bind。"
         )
     if host == "gui":
         warnings.append("未识别到可自动唤醒的宿主（antigravity / claude / codex），手机指令将无法执行，只能用 notify 推送结果。")
